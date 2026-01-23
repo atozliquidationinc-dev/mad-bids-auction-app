@@ -1,104 +1,187 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
-function getAuth() {
-  const credentials = JSON.parse(
-    process.env.GOOGLE_SERVICE_ACCOUNT_JSON as string
-  );
-
-  return new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-  });
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-async function findSubfolderId(
+function normalizeAuctionName(input: string) {
+  const t = (input || "").trim();
+  if (!t) return "";
+  // If they type "22", convert to "Auction 22"
+  if (/^\d+$/.test(t)) return `Auction ${t}`;
+  // If they type "auction 22" or "Auction 22", standardize capitalization
+  if (/^auction\s+\d+$/i.test(t)) {
+    const num = t.match(/\d+/)?.[0] || "";
+    return `Auction ${num}`;
+  }
+  // Otherwise keep as-is (in case you ever name auctions differently)
+  return t;
+}
+
+async function findSheetIdByNameInFolder(
   drive: any,
-  parentFolderId: string,
-  subfolderName: string
+  folderId: string,
+  sheetName: string
 ) {
+  const safeName = sheetName.replace(/'/g, "\\'");
+  const q = [
+    `'${folderId}' in parents`,
+    `mimeType='application/vnd.google-apps.spreadsheet'`,
+    `name='${safeName}'`,
+    `trashed=false`,
+  ].join(" and ");
+
   const res = await drive.files.list({
-    q: `'${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and name='${subfolderName}' and trashed=false`,
-    fields: "files(id, name)",
+    q,
+    fields: "files(id,name)",
+    pageSize: 5,
   });
 
   return res.data.files?.[0]?.id || null;
 }
 
-async function findInvoicePdf(
-  drive: any,
-  folderId: string,
-  bidderNumber: string
-) {
-  const res = await drive.files.list({
-    q: `'${folderId}' in parents and name='${bidderNumber}.pdf' and trashed=false`,
-    fields: "files(id, name, webViewLink)",
-  });
-
-  return res.data.files?.[0] || null;
-}
-
 export async function GET(req: Request) {
   try {
-    const { searchParams } = new URL(req.url);
-    const auction = searchParams.get("auction");
-    const bidderNumber = searchParams.get("bidderNumber");
+    const url = new URL(req.url);
 
-    if (!auction || !bidderNumber) {
+    // Accept ANY of these param names (so UI/backend mismatch won't break it)
+    const auctionRaw = url.searchParams.get("auction") || "";
+    const bidderRaw =
+      url.searchParams.get("bidder") ||
+      url.searchParams.get("bidderNumber") ||
+      url.searchParams.get("bidcard") ||
+      "";
+
+    const auctionName = normalizeAuctionName(auctionRaw);
+    const bidderNumber = (bidderRaw || "").trim();
+
+    if (!auctionName || !bidderNumber) {
       return NextResponse.json(
-        { success: false, error: "Missing auction or bidderNumber" },
+        { success: false, error: "Missing auction or bidder number" },
         { status: 400 }
       );
     }
 
-    const rootFolderId = process.env.AUCTION_INVOICES_FOLDER_ID;
-    if (!rootFolderId) {
-      return NextResponse.json(
-        { success: false, error: "Missing invoice folder env var" },
-        { status: 500 }
-      );
-    }
+    const creds = JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON"));
+    const sheetsFolderId = mustEnv("AUCTION_SHEETS_FOLDER_ID");
 
-    const auth = getAuth();
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+      ],
+    });
+
     const drive = google.drive({ version: "v3", auth });
+    const sheets = google.sheets({ version: "v4", auth });
 
-    // 1) Find auction subfolder
-    const auctionFolderId = await findSubfolderId(
+    // 1) Find the spreadsheet for this auction in your Sheets folder
+    const spreadsheetId = await findSheetIdByNameInFolder(
       drive,
-      rootFolderId,
-      auction
+      sheetsFolderId,
+      auctionName
     );
 
-    if (!auctionFolderId) {
+    if (!spreadsheetId) {
       return NextResponse.json(
-        { success: false, error: "Auction folder not found" },
+        {
+          success: false,
+          error: `Auction sheet not found in Sheets folder: ${auctionName}`,
+        },
         { status: 404 }
       );
     }
 
-    // 2) Find invoice PDF
-    const file = await findInvoicePdf(
-      drive,
-      auctionFolderId,
-      bidderNumber
+    // 2) Get first tab name (so we don't assume Sheet1)
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(title))",
+    });
+
+    const tab = meta.data.sheets?.[0]?.properties?.title;
+    if (!tab) throw new Error("No tabs found in auction sheet");
+
+    // 3) Read data
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${tab}!A:Z`,
+    });
+
+    const rows = (res.data.values ?? []) as any[][];
+    if (rows.length === 0) {
+      return NextResponse.json(
+        { success: false, error: "Sheet is empty" },
+        { status: 400 }
+      );
+    }
+
+    // 4) Find the header row that contains "Bidder Number"
+    let headerRowIndex = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const normalized = r.map((x) => String(x || "").trim().toLowerCase());
+      if (normalized.includes("bidder number")) {
+        headerRowIndex = i;
+        break;
+      }
+    }
+
+    if (headerRowIndex === -1) {
+      return NextResponse.json(
+        { success: false, error: 'Could not find header row ("Bidder Number")' },
+        { status: 400 }
+      );
+    }
+
+    const header = rows[headerRowIndex].map((h) => String(h || "").trim());
+    const bidderIdx = header.findIndex(
+      (h) => h.trim().toLowerCase() === "bidder number"
     );
 
-    if (!file) {
+    if (bidderIdx === -1) {
       return NextResponse.json(
-        { success: false, error: "Invoice not found" },
+        { success: false, error: 'Missing column: "Bidder Number"' },
+        { status: 400 }
+      );
+    }
+
+    // 5) Find matching row after header
+    let foundRowIndex = -1;
+    for (let i = headerRowIndex + 1; i < rows.length; i++) {
+      if (String(rows[i]?.[bidderIdx] ?? "").trim() === bidderNumber) {
+        foundRowIndex = i;
+        break;
+      }
+    }
+
+    if (foundRowIndex === -1) {
+      return NextResponse.json(
+        { success: false, error: `Bidder not found: ${bidderNumber}` },
         { status: 404 }
       );
     }
+
+    const row = rows[foundRowIndex];
+    const record: Record<string, string> = {};
+    header.forEach((h, i) => {
+      if (!h) return;
+      record[h] = String(row?.[i] ?? "");
+    });
 
     return NextResponse.json({
       success: true,
-      previewUrl: `https://drive.google.com/file/d/${file.id}/preview`,
-      openUrl: file.webViewLink,
-      fileName: file.name,
+      auctionName,
+      bidderNumber,
+      record,
+      rowNumber: foundRowIndex + 1,
     });
-  } catch (err: any) {
+  } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: err.message },
+      { success: false, error: e?.message || "Unknown error" },
       { status: 500 }
     );
   }
