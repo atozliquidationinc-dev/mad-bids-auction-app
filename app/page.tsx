@@ -28,9 +28,8 @@ const EDITABLE_FIELDS = [
 ] as const;
 
 export default function Page() {
-  // ✅ Fix dropdown issue: use a manual Auction input (because your API doesn’t provide an auction list)
-  const [auction, setAuction] = useState(""); // e.g. "Auction 22"
-  const [bidcard, setBidcard] = useState(""); // e.g. "20000"
+  const [auction, setAuction] = useState("");   // e.g. Auction 22
+  const [bidNumber, setBidNumber] = useState(""); // e.g. 20000
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -43,8 +42,8 @@ export default function Page() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const canSearch = useMemo(() => {
-    return auction.trim().length > 0 && bidcard.trim().length > 0 && !loading;
-  }, [auction, bidcard, loading]);
+    return auction.trim().length > 0 && bidNumber.trim().length > 0 && !loading;
+  }, [auction, bidNumber, loading]);
 
   function setEditField(key: string, value: string) {
     setEditValues((prev) => ({ ...prev, [key]: value }));
@@ -59,14 +58,19 @@ export default function Page() {
     setEditValues({});
 
     const cleanAuction = auction.trim();
-    const cleanBidcard = bidcard.trim();
+    const cleanBid = bidNumber.trim();
 
     try {
-      // 1) Load bidder row from the Google Sheet
-      const bidderRes = await fetch(
-        `/api/auctions/bidder?auction=${encodeURIComponent(cleanAuction)}&bidder=${encodeURIComponent(cleanBidcard)}`,
-        { cache: "no-store" }
-      );
+      // ✅ Send ALL possible param names to match whatever your backend expects
+      // bidder route: some versions expect bidder, some bidderNumber, some bidcard
+      const bidderUrl =
+        `/api/auctions/bidder?` +
+        `auction=${encodeURIComponent(cleanAuction)}` +
+        `&bidder=${encodeURIComponent(cleanBid)}` +
+        `&bidderNumber=${encodeURIComponent(cleanBid)}` +
+        `&bidcard=${encodeURIComponent(cleanBid)}`;
+
+      const bidderRes = await fetch(bidderUrl, { cache: "no-store" });
       const bidderJson = await bidderRes.json();
 
       if (!bidderRes.ok || bidderJson?.success === false) {
@@ -76,22 +80,26 @@ export default function Page() {
       const rec: BidderRecord = bidderJson.record || {};
       setRecord(rec);
 
-      // preload editable fields
+      // preload editable fields from record
       const initialEdits: Record<string, string> = {};
       for (const f of EDITABLE_FIELDS) initialEdits[f] = rec[f] ?? "";
       setEditValues(initialEdits);
 
-      // 2) Load invoice PDF link from Drive (by bidcard number file name)
-      const invRes = await fetch(
-        `/api/auctions/invoice?auction=${encodeURIComponent(cleanAuction)}&bidcard=${encodeURIComponent(cleanBidcard)}`,
-        { cache: "no-store" }
-      );
+      // ✅ Invoice route: your version expects auction + bidcard
+      // but we also send bidder/bidderNumber as extras just in case
+      const invoiceUrl =
+        `/api/auctions/invoice?` +
+        `auction=${encodeURIComponent(cleanAuction)}` +
+        `&bidcard=${encodeURIComponent(cleanBid)}` +
+        `&bidder=${encodeURIComponent(cleanBid)}` +
+        `&bidderNumber=${encodeURIComponent(cleanBid)}`;
+
+      const invRes = await fetch(invoiceUrl, { cache: "no-store" });
       const invJson = await invRes.json();
 
       if (invRes.ok && invJson?.success && invJson?.link) {
         setInvoiceLink(invJson.link);
       } else {
-        // Don’t hard-fail search if invoice missing
         setInvoiceLink(null);
       }
     } catch (e: any) {
@@ -110,7 +118,7 @@ export default function Page() {
 
     try {
       const cleanAuction = auction.trim();
-      const cleanBidcard = bidcard.trim();
+      const cleanBid = bidNumber.trim();
 
       const res = await fetch(`/api/auctions/update`, {
         method: "POST",
@@ -118,7 +126,9 @@ export default function Page() {
         cache: "no-store",
         body: JSON.stringify({
           auction: cleanAuction,
-          bidder: cleanBidcard,
+          bidder: cleanBid,
+          bidcard: cleanBid,
+          bidderNumber: cleanBid,
           updates: editValues,
         }),
       });
@@ -129,8 +139,6 @@ export default function Page() {
       }
 
       setNotice("Saved ✅");
-
-      // Refresh bidder record after save
       await handleSearch();
     } catch (e: any) {
       setError(e?.message || "Save failed");
@@ -143,21 +151,19 @@ export default function Page() {
     <div className="min-h-screen bg-neutral-950 text-neutral-100">
       {/* Header */}
       <div className="sticky top-0 z-10 border-b border-red-900/50 bg-neutral-950/90 backdrop-blur">
-        <div className="mx-auto w-full max-w-md px-4 py-4">
-          <div className="text-center">
-            <div className="text-2xl font-extrabold tracking-wide text-red-500">
-              MAD BIDS AUCTION
-            </div>
-            <div className="mt-1 text-sm font-medium tracking-wide text-neutral-300">
-              MOBILE LOOK UP TOOL
-            </div>
+        <div className="mx-auto w-full max-w-md px-4 py-4 text-center">
+          <div className="text-2xl font-extrabold tracking-wide text-red-500">
+            MAD BIDS AUCTION
+          </div>
+          <div className="mt-1 text-sm font-medium tracking-wide text-neutral-300">
+            MOBILE LOOK UP TOOL
           </div>
         </div>
       </div>
 
       {/* Body */}
       <div className="mx-auto w-full max-w-md px-4 py-5">
-        {/* Input card */}
+        {/* Search card */}
         <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4 shadow">
           <div className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
             Search
@@ -167,15 +173,15 @@ export default function Page() {
           <input
             value={auction}
             onChange={(e) => setAuction(e.target.value)}
-            placeholder='Type like: "Auction 22"'
+            placeholder='Type: "Auction 22"'
             className="mt-1 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3 text-base outline-none focus:border-red-600"
           />
 
           <label className="mt-3 block text-sm text-neutral-200">Bidcard #</label>
           <input
-            value={bidcard}
-            onChange={(e) => setBidcard(e.target.value)}
-            placeholder='Type like: "20000"'
+            value={bidNumber}
+            onChange={(e) => setBidNumber(e.target.value)}
+            placeholder='Type: "20000"'
             inputMode="numeric"
             className="mt-1 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3 text-base outline-none focus:border-red-600"
           />
@@ -222,7 +228,7 @@ export default function Page() {
               )}
             </div>
 
-            {/* View-only fields */}
+            {/* View-only */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Buyer Info</div>
               <div className="mt-3 space-y-2">
@@ -232,19 +238,16 @@ export default function Page() {
                     className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
                   >
                     <div className="text-xs text-neutral-400">{k}</div>
-                    <div className="text-sm text-neutral-100">
-                      {record[k] ?? ""}
-                    </div>
+                    <div className="text-sm text-neutral-100">{record[k] ?? ""}</div>
                   </div>
                 ))}
               </div>
             </div>
 
-            {/* Editable fields */}
+            {/* Editable */}
             <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4">
-              <div className="text-sm font-bold text-neutral-100">
-                Update Status
-              </div>
+              <div className="text-sm font-bold text-neutral-100">Update Status</div>
+
               <div className="mt-3 space-y-3">
                 {EDITABLE_FIELDS.map((k) => (
                   <div key={k}>
@@ -273,7 +276,6 @@ export default function Page() {
           </div>
         )}
 
-        {/* Footer space */}
         <div className="h-10" />
       </div>
     </div>
