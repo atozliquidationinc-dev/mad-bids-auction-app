@@ -1,29 +1,29 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
-// -------- helpers --------
-function normHeader(h: string) {
-  return h.trim().toLowerCase().replace(/\s+/g, " ");
+function norm(s: string) {
+  return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
 }
 
-function yes(v: any) {
-  const s = String(v ?? "").trim().toLowerCase();
-  // treat: "y", "y ", "y - hibid", "yes" as YES
-  return s === "y" || s.startsWith("y ") || s.startsWith("y-") || s === "yes";
+function isYes(v: unknown) {
+  if (v === null || v === undefined) return false;
+  const s = String(v).trim().toLowerCase();
+  // Accept: "y", "y - hibid", "y-ET", "Y", etc
+  return s.startsWith("y");
 }
 
-function numFromName(name: string) {
-  const m = name.match(/(\d+)/);
-  return m ? parseInt(m[1], 10) : 999999;
+function isBlank(v: unknown) {
+  return v === null || v === undefined || String(v).trim() === "";
 }
 
 function getAuth() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-  const credentials = JSON.parse(raw);
+
+  const creds = JSON.parse(raw);
 
   return new google.auth.GoogleAuth({
-    credentials,
+    credentials: creds,
     scopes: [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       "https://www.googleapis.com/auth/drive.readonly",
@@ -31,159 +31,126 @@ function getAuth() {
   });
 }
 
-// -------- route --------
-export async function GET(req: Request) {
+type ShipmentRow = {
+  auction: number;
+  bidcard: string;
+  firstName: string;
+  lastName: string;
+  lotsBought: string;
+  paymentStatus: string;
+  shippingRequired: string;
+  shippedStatus: string;
+};
+
+export async function GET() {
   try {
-    const url = new URL(req.url);
-
-    // search + sort
-    const q = (url.searchParams.get("q") || "").trim().toLowerCase();
-    const sort = (url.searchParams.get("sort") || "auctionAsc").trim();
-
-    const sheetsFolderId = process.env.AUCTION_SHEETS_FOLDER_ID;
-    if (!sheetsFolderId) {
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+    if (!spreadsheetId) {
       return NextResponse.json(
-        { success: false, error: "Missing AUCTION_SHEETS_FOLDER_ID" },
+        { success: false, error: "Missing GOOGLE_SHEET_ID" },
         { status: 500 }
       );
     }
 
-    const range = process.env.AUCTION_SHEET_RANGE || "Sheet1!A:Z";
-
+    // IMPORTANT:
+    // This assumes each auction is a TAB in the SAME spreadsheet, named like:
+    // "Auction 22", "Auction 23", etc
+    // If your tabs are named differently, change the tab name logic below.
     const auth = getAuth();
-    const drive = google.drive({ version: "v3", auth });
     const sheets = google.sheets({ version: "v4", auth });
 
-    // list auction sheet files in the folder
-    const listRes = await drive.files.list({
-      q: [
-        `'${sheetsFolderId}' in parents`,
-        `mimeType='application/vnd.google-apps.spreadsheet'`,
-        `trashed=false`,
-      ].join(" and "),
-      fields: "files(id,name)",
-      pageSize: 200,
-    });
+    // Get tab names
+    const meta = await sheets.spreadsheets.get({ spreadsheetId });
+    const tabs =
+      meta.data.sheets
+        ?.map((s) => s.properties?.title || "")
+        .filter(Boolean) || [];
 
-    const files = listRes.data.files || [];
+    // Extract auction numbers from tab titles
+    // Accepts: "Auction 22", "22", "AUCTION 22", etc
+    const auctions = tabs
+      .map((t) => {
+        const m = t.match(/(\d+)/);
+        return m ? { title: t, auction: Number(m[1]) } : null;
+      })
+      .filter((x): x is { title: string; auction: number } => !!x)
+      .sort((a, b) => a.auction - b.auction);
 
-    const shipments: any[] = [];
+    const shipments: ShipmentRow[] = [];
 
-    for (const f of files) {
-      const fileId = f.id!;
-      const fileName = f.name || "Auction";
-
-      const valuesRes = await sheets.spreadsheets.values.get({
-        spreadsheetId: fileId,
+    for (const a of auctions) {
+      const range = `'${a.title}'!A:Z`;
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId,
         range,
       });
 
-      const rows = valuesRes.data.values || [];
-      if (!rows.length) continue;
+      const values = (res.data.values || []) as string[][];
+      if (values.length < 2) continue;
 
-      // find the header row (first row that contains "bidder number")
-      let headerRowIndex = -1;
-      for (let i = 0; i < Math.min(rows.length, 10); i++) {
-        const r = rows[i] || [];
-        const joined = r.map((x) => normHeader(String(x ?? ""))).join("|");
-        if (joined.includes("bidder number")) {
-          headerRowIndex = i;
-          break;
-        }
-      }
-      if (headerRowIndex === -1) continue;
+      const headerRow = values[0].map((h) => norm(h));
+      const dataRows = values.slice(1);
 
-      const headerRow = rows[headerRowIndex].map((h) => normHeader(String(h ?? "")));
-      const dataRows = rows.slice(headerRowIndex + 1);
+      const idx = (name: string) => headerRow.findIndex((h) => h === norm(name));
 
-      const idx = (name: string) => headerRow.indexOf(normHeader(name));
+      // Fuzzy header matching:
+      const findIdx = (needle: string) =>
+        headerRow.findIndex((h) => h.includes(norm(needle)));
 
-      const iFirst = idx("buyer first name");
-      const iLast = idx("buyer last name");
-      const iBidder = idx("bidder number");
-      const iLots = idx("lots bought");
-      const iBalance = idx("balance");
-      const iPay = idx("payment status");
-      const iShipReq = idx("shipping required");
-      const iShipped = idx("shipped status"); // handle both spellings below
-      const iShipped2 = idx("shipped status "); // just in case trailing space
-      const iShipped3 = idx("shipped status"); // redundant but harmless
-      const iShippedAlt = idx("shipped status"); // keep
+      const bidderIdx =
+        idx("Bidder Number") !== -1 ? idx("Bidder Number") : findIdx("bidder number");
+      const firstIdx =
+        idx("Buyer First Name") !== -1 ? idx("Buyer First Name") : findIdx("buyer first name");
+      const lastIdx =
+        idx("Buyer Last Name") !== -1 ? idx("Buyer Last Name") : findIdx("buyer last name");
+      const lotsIdx =
+        idx("Lots Bought") !== -1 ? idx("Lots Bought") : findIdx("lots bought");
+      const payIdx =
+        idx("Payment Status") !== -1 ? idx("Payment Status") : findIdx("payment status");
+      const shipReqIdx =
+        idx("Shipping Required") !== -1 ? idx("Shipping Required") : findIdx("shipping required");
+      const shippedIdx =
+        // Your file shows "Shipped status" (lowercase s).  [oai_citation:1‡Auction%2022.pdf.pdf](sediment://file_00000000caf4722fb45af9fe7d31e172)
+        idx("Shipped status") !== -1
+          ? idx("Shipped status")
+          : idx("Shipped Status") !== -1
+          ? idx("Shipped Status")
+          : findIdx("shipped");
 
-      // also accept "shipped status" / "shipped status" / "shipped status"
-      const shippedIndex =
-        iShipped !== -1
-          ? iShipped
-          : headerRow.findIndex((h) => h === "shipped status" || h === "shipped status");
-
-      // If you used "Shipped status" exactly in your sheet, it normalizes to "shipped status" and will match.
-
-      // REQUIRE these to exist
-      if (iBidder === -1 || iPay === -1 || iShipReq === -1) continue;
+      // If we can't find critical columns, skip this tab (but don’t crash)
+      if (bidderIdx === -1 || shipReqIdx === -1 || payIdx === -1) continue;
 
       for (const r of dataRows) {
-        if (!r || r.length === 0) continue;
+        const bidcard = (r[bidderIdx] || "").trim();
+        if (!bidcard) continue;
 
-        const first = iFirst !== -1 ? String(r[iFirst] ?? "").trim() : "";
-        const last = iLast !== -1 ? String(r[iLast] ?? "").trim() : "";
-        const bidder = String(r[iBidder] ?? "").trim();
+        const payment = r[payIdx] ?? "";
+        const shipReq = r[shipReqIdx] ?? "";
+        const shipped = shippedIdx !== -1 ? r[shippedIdx] ?? "" : "";
 
-        if (!bidder) continue;
-
-        const lots = iLots !== -1 ? Number(String(r[iLots] ?? "0").trim() || "0") : 0;
-        const balance = iBalance !== -1 ? String(r[iBalance] ?? "").trim() : "";
-
-        const paymentOk = yes(r[iPay]);
-        const shippingRequired = yes(r[iShipReq]);
-
-        // shipped column might be missing or blank; treat missing as NOT shipped
-        const shippedVal =
-          shippedIndex !== -1 ? r[shippedIndex] : (headerRow.includes("shipped status") ? "" : "");
-        const shippedOk = yes(shippedVal);
-
-        // our rule: show shipments only if shippingRequired + paymentOk + NOT shipped
-        if (shippingRequired && paymentOk && !shippedOk) {
+        // Outstanding shipments rule:
+        // - Shipping Required: YES
+        // - Payment Status: YES
+        // - Shipped status: blank or NOT yes
+        if (isYes(shipReq) && isYes(payment) && (isBlank(shipped) || !isYes(shipped))) {
           shipments.push({
-            auctionName: fileName,
-            auctionNumber: numFromName(fileName),
-            bidderNumber: bidder,
-            buyerFirstName: first,
-            buyerLastName: last,
-            lotsBought: lots,
-            balance,
-            paymentStatus: r[iPay],
-            shippingRequired: r[iShipReq],
-            shippedStatus: shippedVal ?? "",
+            auction: a.auction,
+            bidcard,
+            firstName: firstIdx !== -1 ? (r[firstIdx] || "").trim() : "",
+            lastName: lastIdx !== -1 ? (r[lastIdx] || "").trim() : "",
+            lotsBought: lotsIdx !== -1 ? (r[lotsIdx] || "").trim() : "",
+            paymentStatus: String(payment || "").trim(),
+            shippingRequired: String(shipReq || "").trim(),
+            shippedStatus: String(shipped || "").trim(),
           });
         }
       }
     }
 
-    // filter by search (name or bidder)
-    let filtered = shipments;
-    if (q) {
-      filtered = filtered.filter((s) => {
-        const full = `${s.buyerFirstName} ${s.buyerLastName}`.toLowerCase();
-        return (
-          full.includes(q) ||
-          String(s.bidderNumber || "").toLowerCase().includes(q)
-        );
-      });
-    }
-
-    // sort
-    filtered.sort((a, b) => {
-      if (sort === "auctionDesc") return b.auctionNumber - a.auctionNumber;
-      if (sort === "lotsAsc") return (a.lotsBought || 0) - (b.lotsBought || 0);
-      if (sort === "lotsDesc") return (b.lotsBought || 0) - (a.lotsBought || 0);
-      // default: auctionAsc
-      return a.auctionNumber - b.auctionNumber;
-    });
-
     return NextResponse.json({
       success: true,
-      count: filtered.length,
-      shipments: filtered,
+      count: shipments.length,
+      shipments,
     });
   } catch (err: any) {
     return NextResponse.json(
