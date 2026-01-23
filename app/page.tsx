@@ -19,11 +19,8 @@ const VIEW_FIELDS = [
   "Notes",
 ] as const;
 
-const EDITABLE_FIELDS = [
-  "Shipped status",
-  "Refund",
-  "Notes",
-] as const;
+// Non-toggle inputs (toggles are instant-save)
+const EDITABLE_FIELDS = ["Refund", "Notes"] as const;
 
 function auctionNameFromNumber(auctionNumber: string) {
   const t = (auctionNumber || "").trim();
@@ -38,7 +35,7 @@ function auctionNameFromNumber(auctionNumber: string) {
 
 function isY(v: string | undefined | null) {
   const t = (v ?? "").trim().toLowerCase();
-  return t === "y" || t.startsWith("y "); // handles "y - hibid", "y -et", etc
+  return t === "y" || t.startsWith("y "); // supports "y - hibid", etc.
 }
 
 function Pill({
@@ -131,8 +128,9 @@ export default function Page() {
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [savingPickup, setSavingPickup] = useState(false);
   const [savingPayment, setSavingPayment] = useState(false);
+  const [savingPickup, setSavingPickup] = useState(false);
+  const [savingShipped, setSavingShipped] = useState(false);
 
   const [record, setRecord] = useState<BidderRecord | null>(null);
   const [invoiceLink, setInvoiceLink] = useState<string | null>(null);
@@ -183,13 +181,13 @@ export default function Page() {
       const rec: BidderRecord = bidderJson.record || {};
       setRecord(rec);
 
-      // preload editable fields
-      const initialEdits: Record<string, string> = {};
-      for (const f of EDITABLE_FIELDS) initialEdits[f] = rec[f] ?? "";
-      // also keep these two in editValues so toggles can write instantly
-      initialEdits["Pickup status"] = rec["Pickup status"] ?? "";
-      initialEdits["Payment Status"] = rec["Payment Status"] ?? "";
-      setEditValues(initialEdits);
+      const initial: Record<string, string> = {};
+      for (const f of EDITABLE_FIELDS) initial[f] = rec[f] ?? "";
+      // keep these in editValues too (toggles)
+      initial["Pickup status"] = rec["Pickup status"] ?? "";
+      initial["Payment Status"] = rec["Payment Status"] ?? "";
+      initial["Shipped status"] = rec["Shipped status"] ?? "";
+      setEditValues(initial);
 
       const invoiceUrl =
         `/api/auctions/invoice?` +
@@ -239,11 +237,10 @@ export default function Page() {
     setNotice(null);
 
     try {
-      // only save non-toggle fields here
       const payload: Record<string, string> = {};
       for (const f of EDITABLE_FIELDS) payload[f] = editValues[f] ?? "";
-
       await saveUpdates(payload);
+
       setNotice("Saved ✅");
       await handleSearch();
     } catch (e: any) {
@@ -253,33 +250,7 @@ export default function Page() {
     }
   }
 
-  // ===== Toggle: Pickup status (instant) =====
-  async function togglePickup(nextOn: boolean) {
-    if (!record) return;
-
-    setSavingPickup(true);
-    setError(null);
-    setNotice(null);
-
-    const nextValue = nextOn ? "Y" : "";
-
-    // optimistic UI
-    setEditValues((p) => ({ ...p, ["Pickup status"]: nextValue }));
-    setRecord((r) => (r ? { ...r, ["Pickup status"]: nextValue } : r));
-
-    try {
-      await saveUpdates({ ["Pickup status"]: nextValue });
-      setNotice(nextOn ? "Pickup marked ✅" : "Pickup cleared ⚠️");
-      await handleSearch();
-    } catch (e: any) {
-      setError(e?.message || "Failed to update pickup");
-      await handleSearch(); // revert to sheet truth
-    } finally {
-      setSavingPickup(false);
-    }
-  }
-
-  // ===== Toggle: Payment Status (instant) =====
+  // ===== Toggle handlers (instant save) =====
   async function togglePayment(nextOn: boolean) {
     if (!record) return;
 
@@ -287,13 +258,11 @@ export default function Page() {
     setError(null);
     setNotice(null);
 
-    // You asked: treat Y as paid. We will write "Y" when ON and blank when OFF.
-    // (This may overwrite values like "y - hibid". If you want to preserve those, tell me.)
     const nextValue = nextOn ? "Y" : "";
 
     // optimistic UI
-    setEditValues((p) => ({ ...p, ["Payment Status"]: nextValue }));
     setRecord((r) => (r ? { ...r, ["Payment Status"]: nextValue } : r));
+    setEditValues((p) => ({ ...p, ["Payment Status"]: nextValue }));
 
     try {
       await saveUpdates({ ["Payment Status"]: nextValue });
@@ -307,15 +276,66 @@ export default function Page() {
     }
   }
 
-  // ===== Bubble logic =====
+  async function togglePickup(nextOn: boolean) {
+    if (!record) return;
+
+    setSavingPickup(true);
+    setError(null);
+    setNotice(null);
+
+    const nextValue = nextOn ? "Y" : "";
+
+    // optimistic UI
+    setRecord((r) => (r ? { ...r, ["Pickup status"]: nextValue } : r));
+    setEditValues((p) => ({ ...p, ["Pickup status"]: nextValue }));
+
+    try {
+      await saveUpdates({ ["Pickup status"]: nextValue });
+      setNotice(nextOn ? "Pickup marked ✅" : "Pickup cleared ⚠️");
+      await handleSearch();
+    } catch (e: any) {
+      setError(e?.message || "Failed to update pickup");
+      await handleSearch();
+    } finally {
+      setSavingPickup(false);
+    }
+  }
+
+  async function toggleShipped(nextOn: boolean) {
+    if (!record) return;
+
+    setSavingShipped(true);
+    setError(null);
+    setNotice(null);
+
+    const nextValue = nextOn ? "Y" : "";
+
+    // optimistic UI
+    setRecord((r) => (r ? { ...r, ["Shipped status"]: nextValue } : r));
+    setEditValues((p) => ({ ...p, ["Shipped status"]: nextValue }));
+
+    try {
+      await saveUpdates({ ["Shipped status"]: nextValue });
+      setNotice(nextOn ? "Marked SHIPPED ✅" : "Marked NOT SHIPPED ⚠️");
+      await handleSearch();
+    } catch (e: any) {
+      setError(e?.message || "Failed to update shipped status");
+      await handleSearch();
+    } finally {
+      setSavingShipped(false);
+    }
+  }
+
+  // ===== Bubble + conditional logic =====
   const paymentVal = String(record?.["Payment Status"] ?? "");
   const pickupVal = String(record?.["Pickup status"] ?? "");
   const shipReqVal = String(record?.["Shipping Required"] ?? "");
   const shippedVal = String(record?.["Shipped status"] ?? "");
 
+  const shipReqIsY = isY(shipReqVal);
+
   const paymentIsY = isY(paymentVal);
   const pickupIsY = isY(pickupVal);
-  const shipReqIsY = isY(shipReqVal);
   const shippedIsY = isY(shippedVal);
 
   return (
@@ -404,17 +424,29 @@ export default function Page() {
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Buyer Info</div>
 
+              {/* ✅ Bubble row with your new rules */}
               <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                {/* Payment always */}
                 <div>
                   <div className="text-xs text-neutral-400">Payment</div>
-                  <Pill variant={paymentIsY ? "green" : "red"} text={paymentIsY ? "PAID" : "NOT PAID"} />
+                  <Pill
+                    variant={paymentIsY ? "green" : "red"}
+                    text={paymentIsY ? "PAID" : "NOT PAID"}
+                  />
                 </div>
 
-                <div>
-                  <div className="text-xs text-neutral-400">Picked up</div>
-                  <Pill variant={pickupIsY ? "green" : "red"} text={pickupIsY ? "PICKED" : "NOT PICKED"} />
-                </div>
+                {/* Picked up bubble ONLY if shipping is NOT required */}
+                {!shipReqIsY && (
+                  <div>
+                    <div className="text-xs text-neutral-400">Picked up</div>
+                    <Pill
+                      variant={pickupIsY ? "green" : "red"}
+                      text={pickupIsY ? "PICKED" : "NOT PICKED"}
+                    />
+                  </div>
+                )}
 
+                {/* Shipping Required bubble only if Y */}
                 {shipReqIsY && (
                   <div>
                     <div className="text-xs text-neutral-400">Shipping required</div>
@@ -422,14 +454,19 @@ export default function Page() {
                   </div>
                 )}
 
+                {/* Shipped bubble only if shipping required = Y */}
                 {shipReqIsY && (
                   <div>
                     <div className="text-xs text-neutral-400">Shipped</div>
-                    <Pill variant={shippedIsY ? "green" : "red"} text={shippedIsY ? "SHIPPED" : "NO"} />
+                    <Pill
+                      variant={shippedIsY ? "green" : "red"}
+                      text={shippedIsY ? "SHIPPED" : "NO"}
+                    />
                   </div>
                 )}
               </div>
 
+              {/* Details list */}
               <div className="mt-3 space-y-2">
                 {VIEW_FIELDS.map((k) => (
                   <div
@@ -447,29 +484,85 @@ export default function Page() {
             <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Update Status</div>
 
-              {/* Pickup toggle */}
-              <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
-                <div className="text-xs text-neutral-400">Pickup status</div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 12 }}>
-                  <div className="text-sm text-neutral-100">
-                    {pickupIsY ? "Y (Picked up)" : "Blank (Not picked up)"}
-                  </div>
-                  <Toggle checked={pickupIsY} onChange={togglePickup} disabled={savingPickup} />
-                </div>
-                <div className="mt-2 text-xs text-neutral-400">Updates the sheet immediately.</div>
-              </div>
-
-              {/* Payment toggle */}
+              {/* ✅ Payment toggle FIRST */}
               <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
                 <div className="text-xs text-neutral-400">Payment status</div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 12 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginTop: 8,
+                    gap: 12,
+                  }}
+                >
                   <div className="text-sm text-neutral-100">
                     {paymentIsY ? "Y (Paid)" : "Blank (Not paid)"}
                   </div>
-                  <Toggle checked={paymentIsY} onChange={togglePayment} disabled={savingPayment} />
+                  <Toggle
+                    checked={paymentIsY}
+                    onChange={togglePayment}
+                    disabled={savingPayment}
+                  />
                 </div>
-                <div className="mt-2 text-xs text-neutral-400">Updates the sheet immediately.</div>
+                <div className="mt-2 text-xs text-neutral-400">
+                  Updates the sheet immediately.
+                </div>
               </div>
+
+              {/* ✅ Pickup toggle SECOND */}
+              <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
+                <div className="text-xs text-neutral-400">Pickup status</div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginTop: 8,
+                    gap: 12,
+                  }}
+                >
+                  <div className="text-sm text-neutral-100">
+                    {pickupIsY ? "Y (Picked up)" : "Blank (Not picked up)"}
+                  </div>
+                  <Toggle
+                    checked={pickupIsY}
+                    onChange={togglePickup}
+                    disabled={savingPickup}
+                  />
+                </div>
+                <div className="mt-2 text-xs text-neutral-400">
+                  Updates the sheet immediately.
+                </div>
+              </div>
+
+              {/* ✅ Shipped toggle ONLY if Shipping Required = Y */}
+              {shipReqIsY && (
+                <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
+                  <div className="text-xs text-neutral-400">Shipped status</div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginTop: 8,
+                      gap: 12,
+                    }}
+                  >
+                    <div className="text-sm text-neutral-100">
+                      {shippedIsY ? "Y (Shipped)" : "Blank (Not shipped)"}
+                    </div>
+                    <Toggle
+                      checked={shippedIsY}
+                      onChange={toggleShipped}
+                      disabled={savingShipped}
+                    />
+                  </div>
+                  <div className="mt-2 text-xs text-neutral-400">
+                    Only shown when Shipping Required = Y. Updates the sheet immediately.
+                  </div>
+                </div>
+              )}
 
               {/* Other editable fields */}
               <div className="mt-3 space-y-3">
