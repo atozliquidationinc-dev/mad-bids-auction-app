@@ -1,131 +1,272 @@
-import { NextResponse } from "next/server";
-import { google } from "googleapis";
+"use client";
 
-function mustEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
+import { useState } from "react";
 
-async function findSheetIdByAuctionName(drive: any, sheetsFolderId: string, auctionName: string) {
-  const safeName = auctionName.replace(/'/g, "\\'");
-  const q = [
-    `'${sheetsFolderId}' in parents`,
-    `mimeType='application/vnd.google-apps.spreadsheet'`,
-    `name='${safeName}'`,
-    `trashed=false`,
-  ].join(" and ");
+type RecordMap = Record<string, string>;
 
-  const res = await drive.files.list({
-    q,
-    fields: "files(id,name)",
-    pageSize: 5,
-  });
+export default function Home() {
+  const [auction, setAuction] = useState("Auction 22");
+  const [bidcard, setBidcard] = useState("");
+  const [record, setRecord] = useState<RecordMap | null>(null);
+  const [invoiceLink, setInvoiceLink] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
 
-  return res.data.files?.[0]?.id || null;
-}
+  // editable fields
+  const [paymentStatus, setPaymentStatus] = useState("");
+  const [pickupStatus, setPickupStatus] = useState("");
+  const [shippedStatus, setShippedStatus] = useState("");
+  const [refund, setRefund] = useState("");
+  const [notes, setNotes] = useState("");
 
-export async function GET(req: Request) {
-  try {
-    const url = new URL(req.url);
-    const auction = url.searchParams.get("auction");
-    const bidcard = url.searchParams.get("bidcard");
+  async function search() {
+    setMsg("");
+    setLoading(true);
+    setRecord(null);
+    setInvoiceLink("");
 
-    if (!auction || !bidcard) {
-      return NextResponse.json(
-        { success: false, error: "Missing auction or bidcard" },
-        { status: 400 }
+    try {
+      const r = await fetch(
+        `/api/auctions/bidder?auction=${encodeURIComponent(
+          auction
+        )}&bidcard=${encodeURIComponent(bidcard)}`
       );
-    }
+      const data = await r.json();
 
-    const creds = JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON"));
-    const sheetsFolderId = mustEnv("AUCTION_SHEETS_FOLDER_ID");
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: [
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-      ],
-    });
-
-    const drive = google.drive({ version: "v3", auth });
-    const sheets = google.sheets({ version: "v4", auth });
-
-    const spreadsheetId = await findSheetIdByAuctionName(drive, sheetsFolderId, auction);
-    if (!spreadsheetId) {
-      return NextResponse.json(
-        { success: false, error: `Sheet not found in Sheets folder: ${auction}` },
-        { status: 404 }
-      );
-    }
-
-    // Read the first tab name so you don’t depend on “Sheet1”
-    const meta = await sheets.spreadsheets.get({
-      spreadsheetId,
-      fields: "sheets(properties(title))",
-    });
-    const tab = meta.data.sheets?.[0]?.properties?.title;
-    if (!tab) throw new Error("No tabs found in the sheet");
-
-    const readRes = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${tab}!A:Z`,
-    });
-
-    const rows = (readRes.data.values ?? []) as string[][];
-    if (rows.length < 2) {
-      return NextResponse.json(
-        { success: false, error: "Sheet has no data rows" },
-        { status: 400 }
-      );
-    }
-
-    const header = rows[0].map((h) => (h || "").trim());
-    const bidderIdx = header.findIndex((h) => h.toLowerCase() === "bidder number");
-    if (bidderIdx === -1) {
-      return NextResponse.json(
-        { success: false, error: "Missing column: Bidder Number" },
-        { status: 400 }
-      );
-    }
-
-    const target = bidcard.trim();
-    let foundRowIndex = -1; // 0-based in rows array
-    for (let i = 1; i < rows.length; i++) {
-      if (String(rows[i]?.[bidderIdx] ?? "").trim() === target) {
-        foundRowIndex = i;
-        break;
+      if (!data.success) {
+        setMsg(data.error || "Not found");
+        setLoading(false);
+        return;
       }
-    }
 
-    if (foundRowIndex === -1) {
-      return NextResponse.json(
-        { success: false, error: `Bidder not found: ${target}` },
-        { status: 404 }
+      const rec: RecordMap = data.record;
+      setRecord(rec);
+
+      // preload editable fields from the sheet headers
+      const get = (name: string) => rec[name] ?? rec[name.toLowerCase()] ?? "";
+
+      setPaymentStatus(get("Payment Status"));
+      // Your sheet might be "Pickup status" (lowercase s), so handle both:
+      setPickupStatus(rec["Pickup Status"] ?? rec["Pickup status"] ?? "");
+      setShippedStatus(rec["Shipped Status"] ?? rec["Shipped status"] ?? "");
+      setRefund(get("Refund"));
+      setNotes(get("Notes"));
+
+      // invoice lookup
+      const inv = await fetch(
+        `/api/auctions/invoice?auction=${encodeURIComponent(
+          auction
+        )}&bidcard=${encodeURIComponent(bidcard)}`
       );
+      const invData = await inv.json();
+      if (invData.success && invData.link) setInvoiceLink(invData.link);
+      else setInvoiceLink("");
+
+      setLoading(false);
+    } catch (e: any) {
+      setMsg(e?.message || "Error");
+      setLoading(false);
     }
-
-    const row = rows[foundRowIndex];
-    const record: Record<string, string> = {};
-    header.forEach((h, i) => {
-      if (!h) return;
-      record[h] = String(row?.[i] ?? "");
-    });
-
-    return NextResponse.json({
-      success: true,
-      auction,
-      bidcard: target,
-      spreadsheetId,
-      tab,
-      rowNumber: foundRowIndex + 1, // 1-based row number inside tab (header is row 1)
-      record,
-    });
-  } catch (e: any) {
-    return NextResponse.json(
-      { success: false, error: e?.message ?? "Unknown error" },
-      { status: 500 }
-    );
   }
+
+  async function save() {
+    setMsg("");
+    setLoading(true);
+    try {
+      const r = await fetch(`/api/auctions/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          auction,
+          bidcard,
+          updates: {
+            paymentStatus,
+            pickupStatus,
+            shippedStatus,
+            refund,
+            notes,
+          },
+        }),
+      });
+
+      const data = await r.json();
+      if (!data.success) {
+        setMsg(data.error || "Save failed");
+        setLoading(false);
+        return;
+      }
+
+      setMsg("Saved ✅");
+      setLoading(false);
+    } catch (e: any) {
+      setMsg(e?.message || "Save error");
+      setLoading(false);
+    }
+  }
+
+  const viewField = (label: string) => (
+    <div style={{ padding: 8, borderBottom: "1px solid #eee" }}>
+      <div style={{ fontSize: 12, opacity: 0.7 }}>{label}</div>
+      <div style={{ fontSize: 16 }}>{record?.[label] || ""}</div>
+    </div>
+  );
+
+  return (
+    <main
+      style={{
+        padding: 16,
+        fontFamily: "Arial, sans-serif",
+        maxWidth: 700,
+        margin: "0 auto",
+      }}
+    >
+      <h2>Mad Bids Employee App</h2>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <input
+          style={{ padding: 10, fontSize: 16, width: 240 }}
+          value={auction}
+          onChange={(e) => setAuction(e.target.value)}
+          placeholder="Auction name (ex: Auction 22)"
+        />
+        <input
+          style={{ padding: 10, fontSize: 16, width: 180 }}
+          value={bidcard}
+          onChange={(e) => setBidcard(e.target.value)}
+          placeholder="Bidcard #"
+          inputMode="numeric"
+        />
+        <button
+          style={{ padding: "10px 14px", fontSize: 16 }}
+          onClick={search}
+          disabled={!auction || !bidcard || loading}
+        >
+          {loading ? "Working..." : "Search"}
+        </button>
+      </div>
+
+      {msg ? <p style={{ marginTop: 10 }}>{msg}</p> : null}
+
+      {record ? (
+        <div
+          style={{
+            marginTop: 16,
+            border: "1px solid #ddd",
+            borderRadius: 8,
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              padding: 12,
+              background: "#f6f6f6",
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 700 }}>
+                {record["Buyer First Name"]} {record["Buyer Last Name"]} — #
+                {record["Bidder Number"]}
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.75 }}>{auction}</div>
+            </div>
+
+            {invoiceLink ? (
+              <a
+                href={invoiceLink}
+                target="_blank"
+                style={{
+                  alignSelf: "center",
+                  padding: "8px 10px",
+                  border: "1px solid #ccc",
+                  borderRadius: 6,
+                }}
+              >
+                Open Invoice
+              </a>
+            ) : (
+              <div style={{ alignSelf: "center", fontSize: 12, opacity: 0.7 }}>
+                No invoice found
+              </div>
+            )}
+          </div>
+
+          {/* view-only fields */}
+          {viewField("Buyer First Name")}
+          {viewField("Buyer Last Name")}
+          {viewField("Bidder Number")}
+          {viewField("Buyer Phone")}
+          {viewField("Lots Bought")}
+          {viewField("Balance")}
+          {viewField("Payment Status")}
+          {viewField("Shipping Required")}
+          {viewField("Pickup status")}
+          {viewField("Shipped status")}
+          {viewField("Refund")}
+          {viewField("Notes")}
+
+          {/* editable fields */}
+          <div style={{ padding: 12, background: "#fafafa" }}>
+            <h3 style={{ margin: "6px 0 10px" }}>Editable</h3>
+
+            <label style={{ display: "block", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Payment Status</div>
+              <input
+                style={{ padding: 10, fontSize: 16, width: "100%" }}
+                value={paymentStatus}
+                onChange={(e) => setPaymentStatus(e.target.value)}
+              />
+            </label>
+
+            <label style={{ display: "block", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Pickup Status</div>
+              <input
+                style={{ padding: 10, fontSize: 16, width: "100%" }}
+                value={pickupStatus}
+                onChange={(e) => setPickupStatus(e.target.value)}
+              />
+            </label>
+
+            <label style={{ display: "block", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Shipped Status</div>
+              <input
+                style={{ padding: 10, fontSize: 16, width: "100%" }}
+                value={shippedStatus}
+                onChange={(e) => setShippedStatus(e.target.value)}
+              />
+            </label>
+
+            <label style={{ display: "block", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Refund</div>
+              <input
+                style={{ padding: 10, fontSize: 16, width: "100%" }}
+                value={refund}
+                onChange={(e) => setRefund(e.target.value)}
+              />
+            </label>
+
+            <label style={{ display: "block", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Notes</div>
+              <textarea
+                style={{ padding: 10, fontSize: 16, width: "100%", minHeight: 80 }}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+            </label>
+
+            <button
+              style={{ padding: "10px 14px", fontSize: 16 }}
+              onClick={save}
+              disabled={loading}
+            >
+              {loading ? "Saving..." : "Save Changes"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </main>
+  );
 }
