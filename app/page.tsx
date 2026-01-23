@@ -27,9 +27,22 @@ const EDITABLE_FIELDS = [
   "Payment Status",
 ] as const;
 
+function auctionNameFromNumber(auctionNumber: string) {
+  const t = (auctionNumber || "").trim();
+  if (!t) return "";
+  // If user typed "22" -> "Auction 22"
+  if (/^\d+$/.test(t)) return `Auction ${t}`;
+  // If they typed "Auction 22" anyway, keep it
+  if (/^auction\s+\d+$/i.test(t)) {
+    const num = t.match(/\d+/)?.[0] || "";
+    return `Auction ${num}`;
+  }
+  return t;
+}
+
 export default function Page() {
-  const [auction, setAuction] = useState("");   // e.g. Auction 22
-  const [bidNumber, setBidNumber] = useState(""); // e.g. 20000
+  const [auctionNumber, setAuctionNumber] = useState(""); // user types: 22
+  const [bidcard, setBidcard] = useState(""); // user types: 20000
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -41,9 +54,14 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const auctionName = useMemo(
+    () => auctionNameFromNumber(auctionNumber),
+    [auctionNumber]
+  );
+
   const canSearch = useMemo(() => {
-    return auction.trim().length > 0 && bidNumber.trim().length > 0 && !loading;
-  }, [auction, bidNumber, loading]);
+    return auctionName.trim().length > 0 && bidcard.trim().length > 0 && !loading;
+  }, [auctionName, bidcard, loading]);
 
   function setEditField(key: string, value: string) {
     setEditValues((prev) => ({ ...prev, [key]: value }));
@@ -57,18 +75,17 @@ export default function Page() {
     setInvoiceLink(null);
     setEditValues({});
 
-    const cleanAuction = auction.trim();
-    const cleanBid = bidNumber.trim();
+    const cleanAuctionName = auctionName.trim();
+    const cleanBidcard = bidcard.trim();
 
     try {
-      // ✅ Send ALL possible param names to match whatever your backend expects
-      // bidder route: some versions expect bidder, some bidderNumber, some bidcard
+      // Bidder data from Sheets (we send both bidder + bidderNumber + bidcard to be safe)
       const bidderUrl =
         `/api/auctions/bidder?` +
-        `auction=${encodeURIComponent(cleanAuction)}` +
-        `&bidder=${encodeURIComponent(cleanBid)}` +
-        `&bidderNumber=${encodeURIComponent(cleanBid)}` +
-        `&bidcard=${encodeURIComponent(cleanBid)}`;
+        `auction=${encodeURIComponent(cleanAuctionName)}` +
+        `&bidder=${encodeURIComponent(cleanBidcard)}` +
+        `&bidderNumber=${encodeURIComponent(cleanBidcard)}` +
+        `&bidcard=${encodeURIComponent(cleanBidcard)}`;
 
       const bidderRes = await fetch(bidderUrl, { cache: "no-store" });
       const bidderJson = await bidderRes.json();
@@ -80,28 +97,21 @@ export default function Page() {
       const rec: BidderRecord = bidderJson.record || {};
       setRecord(rec);
 
-      // preload editable fields from record
       const initialEdits: Record<string, string> = {};
       for (const f of EDITABLE_FIELDS) initialEdits[f] = rec[f] ?? "";
       setEditValues(initialEdits);
 
-      // ✅ Invoice route: your version expects auction + bidcard
-      // but we also send bidder/bidderNumber as extras just in case
+      // Invoice from Drive (your invoice route expects auction + bidcard)
       const invoiceUrl =
         `/api/auctions/invoice?` +
-        `auction=${encodeURIComponent(cleanAuction)}` +
-        `&bidcard=${encodeURIComponent(cleanBid)}` +
-        `&bidder=${encodeURIComponent(cleanBid)}` +
-        `&bidderNumber=${encodeURIComponent(cleanBid)}`;
+        `auction=${encodeURIComponent(cleanAuctionName)}` +
+        `&bidcard=${encodeURIComponent(cleanBidcard)}`;
 
       const invRes = await fetch(invoiceUrl, { cache: "no-store" });
       const invJson = await invRes.json();
 
-      if (invRes.ok && invJson?.success && invJson?.link) {
-        setInvoiceLink(invJson.link);
-      } else {
-        setInvoiceLink(null);
-      }
+      if (invRes.ok && invJson?.success && invJson?.link) setInvoiceLink(invJson.link);
+      else setInvoiceLink(null);
     } catch (e: any) {
       setError(e?.message || "Something went wrong");
     } finally {
@@ -117,18 +127,18 @@ export default function Page() {
     setNotice(null);
 
     try {
-      const cleanAuction = auction.trim();
-      const cleanBid = bidNumber.trim();
+      const cleanAuctionName = auctionName.trim();
+      const cleanBidcard = bidcard.trim();
 
       const res = await fetch(`/api/auctions/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify({
-          auction: cleanAuction,
-          bidder: cleanBid,
-          bidcard: cleanBid,
-          bidderNumber: cleanBid,
+          auction: cleanAuctionName,
+          bidder: cleanBidcard,
+          bidcard: cleanBidcard,
+          bidderNumber: cleanBidcard,
           updates: editValues,
         }),
       });
@@ -149,7 +159,6 @@ export default function Page() {
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100">
-      {/* Header */}
       <div className="sticky top-0 z-10 border-b border-red-900/50 bg-neutral-950/90 backdrop-blur">
         <div className="mx-auto w-full max-w-md px-4 py-4 text-center">
           <div className="text-2xl font-extrabold tracking-wide text-red-500">
@@ -161,26 +170,28 @@ export default function Page() {
         </div>
       </div>
 
-      {/* Body */}
       <div className="mx-auto w-full max-w-md px-4 py-5">
-        {/* Search card */}
         <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4 shadow">
           <div className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
             Search
           </div>
 
-          <label className="mt-3 block text-sm text-neutral-200">Auction</label>
+          <label className="mt-3 block text-sm text-neutral-200">Auction #</label>
           <input
-            value={auction}
-            onChange={(e) => setAuction(e.target.value)}
-            placeholder='Type: "Auction 22"'
+            value={auctionNumber}
+            onChange={(e) => setAuctionNumber(e.target.value)}
+            placeholder='Type: "22"'
+            inputMode="numeric"
             className="mt-1 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3 text-base outline-none focus:border-red-600"
           />
+          <div className="mt-1 text-xs text-neutral-400">
+            Will search: <span className="text-neutral-200">{auctionName || "—"}</span>
+          </div>
 
           <label className="mt-3 block text-sm text-neutral-200">Bidcard #</label>
           <input
-            value={bidNumber}
-            onChange={(e) => setBidNumber(e.target.value)}
+            value={bidcard}
+            onChange={(e) => setBidcard(e.target.value)}
             placeholder='Type: "20000"'
             inputMode="numeric"
             className="mt-1 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3 text-base outline-none focus:border-red-600"
@@ -206,10 +217,8 @@ export default function Page() {
           )}
         </div>
 
-        {/* Results */}
         {record && (
           <div className="mt-4 space-y-4">
-            {/* Invoice */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Invoice</div>
               {invoiceLink ? (
@@ -228,7 +237,6 @@ export default function Page() {
               )}
             </div>
 
-            {/* View-only */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Buyer Info</div>
               <div className="mt-3 space-y-2">
@@ -244,10 +252,8 @@ export default function Page() {
               </div>
             </div>
 
-            {/* Editable */}
             <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Update Status</div>
-
               <div className="mt-3 space-y-3">
                 {EDITABLE_FIELDS.map((k) => (
                   <div key={k}>
@@ -268,10 +274,6 @@ export default function Page() {
               >
                 {saving ? "Saving..." : "Save changes"}
               </button>
-
-              <div className="mt-2 text-xs text-neutral-400">
-                Editable: Pickup status, Shipped status, Refund, Notes, Payment Status
-              </div>
             </div>
           </div>
         )}
