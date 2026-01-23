@@ -20,11 +20,9 @@ const VIEW_FIELDS = [
 ] as const;
 
 const EDITABLE_FIELDS = [
-  "Pickup status",
   "Shipped status",
   "Refund",
   "Notes",
-  "Payment Status",
 ] as const;
 
 function auctionNameFromNumber(auctionNumber: string) {
@@ -39,49 +37,43 @@ function auctionNameFromNumber(auctionNumber: string) {
 }
 
 function isY(v: string | undefined | null) {
-  return (v ?? "").trim().toLowerCase() === "y";
+  const t = (v ?? "").trim().toLowerCase();
+  return t === "y" || t.startsWith("y "); // handles "y - hibid", "y -et", etc
 }
 
-function isEmpty(v: string | undefined | null) {
-  return (v ?? "").trim().length === 0;
-}
-
-function StatusPill({
-  value,
-  emptyLabel = "NO",
-  yLabel = "YES",
+function Pill({
+  variant,
+  text,
 }: {
-  value: string;
-  emptyLabel?: string;
-  yLabel?: string;
+  variant: "green" | "red";
+  text: string;
 }) {
-  const on = isY(value);
-  const text = on ? yLabel : emptyLabel;
-
-  // Aesthetic hues: emerald + rose on dark background
-  const style: React.CSSProperties = on
-    ? {
-        display: "inline-block",
-        padding: "6px 10px",
-        borderRadius: 999,
-        background: "rgba(16, 185, 129, 0.18)", // emerald
-        border: "1px solid rgba(16, 185, 129, 0.35)",
-        color: "rgba(167, 243, 208, 1)",
-        fontSize: 12,
-        fontWeight: 800,
-        letterSpacing: 0.6,
-      }
-    : {
-        display: "inline-block",
-        padding: "6px 10px",
-        borderRadius: 999,
-        background: "rgba(244, 63, 94, 0.16)", // rose
-        border: "1px solid rgba(244, 63, 94, 0.35)",
-        color: "rgba(254, 205, 211, 1)",
-        fontSize: 12,
-        fontWeight: 800,
-        letterSpacing: 0.6,
-      };
+  const style: React.CSSProperties =
+    variant === "green"
+      ? {
+          display: "inline-block",
+          padding: "6px 10px",
+          borderRadius: 999,
+          background: "rgba(16, 185, 129, 0.18)",
+          border: "1px solid rgba(16, 185, 129, 0.35)",
+          color: "rgba(167, 243, 208, 1)",
+          fontSize: 12,
+          fontWeight: 900,
+          letterSpacing: 0.7,
+          textTransform: "uppercase",
+        }
+      : {
+          display: "inline-block",
+          padding: "6px 10px",
+          borderRadius: 999,
+          background: "rgba(244, 63, 94, 0.16)",
+          border: "1px solid rgba(244, 63, 94, 0.35)",
+          color: "rgba(254, 205, 211, 1)",
+          fontSize: 12,
+          fontWeight: 900,
+          letterSpacing: 0.7,
+          textTransform: "uppercase",
+        };
 
   return <span style={style}>{text}</span>;
 }
@@ -95,7 +87,6 @@ function Toggle({
   onChange: (next: boolean) => void;
   disabled?: boolean;
 }) {
-  // Mobile-friendly toggle with red/green glow
   return (
     <button
       type="button"
@@ -141,11 +132,12 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savingPickup, setSavingPickup] = useState(false);
+  const [savingPayment, setSavingPayment] = useState(false);
 
   const [record, setRecord] = useState<BidderRecord | null>(null);
   const [invoiceLink, setInvoiceLink] = useState<string | null>(null);
-
   const [editValues, setEditValues] = useState<Record<string, string>>({});
+
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -174,7 +166,6 @@ export default function Page() {
     const cleanBidcard = bidcard.trim();
 
     try {
-      // Bidder lookup (send multiple param names to match your backend variants)
       const bidderUrl =
         `/api/auctions/bidder?` +
         `auction=${encodeURIComponent(cleanAuctionName)}` +
@@ -192,11 +183,14 @@ export default function Page() {
       const rec: BidderRecord = bidderJson.record || {};
       setRecord(rec);
 
+      // preload editable fields
       const initialEdits: Record<string, string> = {};
       for (const f of EDITABLE_FIELDS) initialEdits[f] = rec[f] ?? "";
+      // also keep these two in editValues so toggles can write instantly
+      initialEdits["Pickup status"] = rec["Pickup status"] ?? "";
+      initialEdits["Payment Status"] = rec["Payment Status"] ?? "";
       setEditValues(initialEdits);
 
-      // Invoice lookup (your invoice route expects auction + bidcard)
       const invoiceUrl =
         `/api/auctions/invoice?` +
         `auction=${encodeURIComponent(cleanAuctionName)}` +
@@ -245,7 +239,11 @@ export default function Page() {
     setNotice(null);
 
     try {
-      await saveUpdates(editValues);
+      // only save non-toggle fields here
+      const payload: Record<string, string> = {};
+      for (const f of EDITABLE_FIELDS) payload[f] = editValues[f] ?? "";
+
+      await saveUpdates(payload);
       setNotice("Saved ✅");
       await handleSearch();
     } catch (e: any) {
@@ -255,8 +253,8 @@ export default function Page() {
     }
   }
 
-  // ✅ Instant-save pickup toggle
-  async function handlePickupToggle(nextOn: boolean) {
+  // ===== Toggle: Pickup status (instant) =====
+  async function togglePickup(nextOn: boolean) {
     if (!record) return;
 
     setSavingPickup(true);
@@ -265,24 +263,60 @@ export default function Page() {
 
     const nextValue = nextOn ? "Y" : "";
 
-    // Update UI immediately (optimistic)
-    setEditValues((prev) => ({ ...prev, ["Pickup status"]: nextValue }));
+    // optimistic UI
+    setEditValues((p) => ({ ...p, ["Pickup status"]: nextValue }));
+    setRecord((r) => (r ? { ...r, ["Pickup status"]: nextValue } : r));
 
     try {
       await saveUpdates({ ["Pickup status"]: nextValue });
       setNotice(nextOn ? "Pickup marked ✅" : "Pickup cleared ⚠️");
       await handleSearch();
     } catch (e: any) {
-      // revert on failure
-      setEditValues((prev) => ({ ...prev, ["Pickup status"]: record["Pickup status"] ?? "" }));
       setError(e?.message || "Failed to update pickup");
+      await handleSearch(); // revert to sheet truth
     } finally {
       setSavingPickup(false);
     }
   }
 
-  const pickupY = isY(editValues["Pickup status"] ?? record?.["Pickup status"]);
-  const paymentY = isY(record?.["Payment Status"] ?? "");
+  // ===== Toggle: Payment Status (instant) =====
+  async function togglePayment(nextOn: boolean) {
+    if (!record) return;
+
+    setSavingPayment(true);
+    setError(null);
+    setNotice(null);
+
+    // You asked: treat Y as paid. We will write "Y" when ON and blank when OFF.
+    // (This may overwrite values like "y - hibid". If you want to preserve those, tell me.)
+    const nextValue = nextOn ? "Y" : "";
+
+    // optimistic UI
+    setEditValues((p) => ({ ...p, ["Payment Status"]: nextValue }));
+    setRecord((r) => (r ? { ...r, ["Payment Status"]: nextValue } : r));
+
+    try {
+      await saveUpdates({ ["Payment Status"]: nextValue });
+      setNotice(nextOn ? "Marked PAID ✅" : "Marked NOT PAID ⚠️");
+      await handleSearch();
+    } catch (e: any) {
+      setError(e?.message || "Failed to update payment");
+      await handleSearch();
+    } finally {
+      setSavingPayment(false);
+    }
+  }
+
+  // ===== Bubble logic =====
+  const paymentVal = String(record?.["Payment Status"] ?? "");
+  const pickupVal = String(record?.["Pickup status"] ?? "");
+  const shipReqVal = String(record?.["Shipping Required"] ?? "");
+  const shippedVal = String(record?.["Shipped status"] ?? "");
+
+  const paymentIsY = isY(paymentVal);
+  const pickupIsY = isY(pickupVal);
+  const shipReqIsY = isY(shipReqVal);
+  const shippedIsY = isY(shippedVal);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100">
@@ -366,39 +400,46 @@ export default function Page() {
               )}
             </div>
 
-            {/* Buyer Info */}
+            {/* Buyer Info + bubbles */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Buyer Info</div>
 
-              {/* Highlight pills */}
               <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                 <div>
                   <div className="text-xs text-neutral-400">Payment</div>
-                  <StatusPill value={record["Payment Status"] ?? ""} emptyLabel="NOT PAID" yLabel="PAID" />
+                  <Pill variant={paymentIsY ? "green" : "red"} text={paymentIsY ? "PAID" : "NOT PAID"} />
                 </div>
+
                 <div>
-                  <div className="text-xs text-neutral-400">Picked Up</div>
-                  <StatusPill value={record["Pickup status"] ?? ""} emptyLabel="NOT PICKED" yLabel="PICKED" />
+                  <div className="text-xs text-neutral-400">Picked up</div>
+                  <Pill variant={pickupIsY ? "green" : "red"} text={pickupIsY ? "PICKED" : "NOT PICKED"} />
                 </div>
+
+                {shipReqIsY && (
+                  <div>
+                    <div className="text-xs text-neutral-400">Shipping required</div>
+                    <Pill variant="green" text="SHIPPING REQUIRED" />
+                  </div>
+                )}
+
+                {shipReqIsY && (
+                  <div>
+                    <div className="text-xs text-neutral-400">Shipped</div>
+                    <Pill variant={shippedIsY ? "green" : "red"} text={shippedIsY ? "SHIPPED" : "NO"} />
+                  </div>
+                )}
               </div>
 
               <div className="mt-3 space-y-2">
-                {VIEW_FIELDS.map((k) => {
-                  // For these two we already show pills, but still show raw value below for transparency
-                  const val = record[k] ?? "";
-                  const isSpecial = k === "Payment Status" || k === "Pickup status";
-                  return (
-                    <div
-                      key={k}
-                      className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
-                    >
-                      <div className="text-xs text-neutral-400">{k}</div>
-                      <div className="text-sm text-neutral-100">
-                        {isSpecial ? (isEmpty(val) ? "—" : val) : val}
-                      </div>
-                    </div>
-                  );
-                })}
+                {VIEW_FIELDS.map((k) => (
+                  <div
+                    key={k}
+                    className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
+                  >
+                    <div className="text-xs text-neutral-400">{k}</div>
+                    <div className="text-sm text-neutral-100">{record[k] ?? ""}</div>
+                  </div>
+                ))}
               </div>
             </div>
 
@@ -406,23 +447,33 @@ export default function Page() {
             <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Update Status</div>
 
-              {/* Pickup toggle (instant save) */}
+              {/* Pickup toggle */}
               <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
                 <div className="text-xs text-neutral-400">Pickup status</div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 12 }}>
                   <div className="text-sm text-neutral-100">
-                    {pickupY ? "Y (Picked up)" : "Blank (Not picked up)"}
+                    {pickupIsY ? "Y (Picked up)" : "Blank (Not picked up)"}
                   </div>
-                  <Toggle checked={pickupY} onChange={handlePickupToggle} disabled={savingPickup} />
+                  <Toggle checked={pickupIsY} onChange={togglePickup} disabled={savingPickup} />
                 </div>
-                <div className="mt-2 text-xs text-neutral-400">
-                  Toggling updates the sheet immediately.
-                </div>
+                <div className="mt-2 text-xs text-neutral-400">Updates the sheet immediately.</div>
               </div>
 
-              {/* Other editable fields stay as inputs */}
+              {/* Payment toggle */}
+              <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
+                <div className="text-xs text-neutral-400">Payment status</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 12 }}>
+                  <div className="text-sm text-neutral-100">
+                    {paymentIsY ? "Y (Paid)" : "Blank (Not paid)"}
+                  </div>
+                  <Toggle checked={paymentIsY} onChange={togglePayment} disabled={savingPayment} />
+                </div>
+                <div className="mt-2 text-xs text-neutral-400">Updates the sheet immediately.</div>
+              </div>
+
+              {/* Other editable fields */}
               <div className="mt-3 space-y-3">
-                {EDITABLE_FIELDS.filter((f) => f !== "Pickup status").map((k) => (
+                {EDITABLE_FIELDS.map((k) => (
                   <div key={k}>
                     <div className="text-xs text-neutral-400">{k}</div>
                     <input
