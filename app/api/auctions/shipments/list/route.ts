@@ -1,27 +1,46 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
+/**
+ * Shipments List API
+ * Returns all shipments that should be done:
+ * - Shipping Required = Y
+ * - Payment Status = Y (or starts with "y")
+ * - Shipped Status is blank
+ *
+ * We scan ALL tabs in the Google Sheet whose name looks like "Auction 22"
+ * and treat that number as the auction number.
+ *
+ * ENV REQUIRED:
+ * - GOOGLE_SERVICE_ACCOUNT_JSON  (the JSON string of the service account)
+ * - GOOGLE_SHEET_ID              (the master spreadsheet id)
+ */
+
 function norm(s: string) {
-  return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+  return (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[_-]+/g, " ");
 }
 
-function isYes(v: unknown) {
-  if (v === null || v === undefined) return false;
-  return String(v).trim().toLowerCase().startsWith("y"); // y, Y, y - hibid, etc
+function isYes(v: string | undefined) {
+  const t = (v || "").toString().trim().toLowerCase();
+  return t === "y" || t.startsWith("y ");
 }
 
-function isBlank(v: unknown) {
-  return v === null || v === undefined || String(v).trim() === "";
+function isBlank(v: string | undefined) {
+  return !v || (typeof v === "string" && v.trim() === "");
 }
 
 function getAuth() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
 
-  const creds = JSON.parse(raw);
+  const credentials = JSON.parse(raw);
 
   return new google.auth.GoogleAuth({
-    credentials: creds,
+    credentials,
     scopes: [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       "https://www.googleapis.com/auth/drive.readonly",
@@ -29,157 +48,201 @@ function getAuth() {
   });
 }
 
-function extractAuctionNumber(name: string): number | null {
-  const m = (name || "").match(/(\d+)/);
-  return m ? Number(m[1]) : null;
-}
-
 type ShipmentRow = {
   auction: number;
+  auctionName: string;
   bidcard: string;
   firstName: string;
   lastName: string;
   lotsBought: string;
+  balance: string;
   paymentStatus: string;
   shippingRequired: string;
   shippedStatus: string;
+  refund: string;
+  notes: string;
 };
 
-export async function GET(req: Request) {
+function findHeaderIndex(headers: string[], candidates: string[]) {
+  const normalized = headers.map((h) => norm(h));
+  for (const c of candidates) {
+    const idx = normalized.indexOf(norm(c));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+export async function GET() {
   try {
-    const folderId = process.env.AUCTION_SHEETS_FOLDER_ID;
-    if (!folderId) {
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+    if (!spreadsheetId) {
       return NextResponse.json(
-        { success: false, error: "Missing AUCTION_SHEETS_FOLDER_ID" },
+        { success: false, error: "Missing GOOGLE_SHEET_ID" },
         { status: 500 }
       );
     }
 
     const auth = getAuth();
-    const drive = google.drive({ version: "v3", auth });
-    const sheets = google.sheets({ version: "v4", auth });
+    const sheetsApi = google.sheets({ version: "v4", auth });
 
-    // 1) List all auction spreadsheets in the folder
-    const q = [
-      `'${folderId}' in parents`,
-      `mimeType='application/vnd.google-apps.spreadsheet'`,
-      `trashed=false`,
-    ].join(" and ");
-
-    const listRes = await drive.files.list({
-      q,
-      fields: "files(id,name)",
-      pageSize: 200,
+    // 1) Get all sheet tabs
+    const meta = await sheetsApi.spreadsheets.get({
+      spreadsheetId,
     });
 
-    const files = (listRes.data.files || [])
-      .map((f) => ({
-        id: f.id || "",
-        name: f.name || "",
-        auction: extractAuctionNumber(f.name || ""),
-      }))
-      .filter((f) => f.id && f.auction !== null)
-      .sort((a, b) => (a.auction! - b.auction!));
+    const sheetTitles =
+      meta.data.sheets
+        ?.map((s) => s.properties?.title)
+        .filter((t): t is string => !!t) || [];
 
-    // If this is 0, that means your folder contains no Google Sheets files
-    // with a number in the name.
-    const shipments: ShipmentRow[] = [];
+    // Only tabs that look like "Auction 22" (case-insensitive)
+    const auctionTabs = sheetTitles
+      .map((title) => {
+        const m = title.match(/auction\s*(\d+)/i);
+        if (!m) return null;
+        return {
+          title,
+          auction: Number(m[1]),
+        };
+      })
+      .filter((x): x is { title: string; auction: number } => !!x)
+      .sort((a, b) => a.auction - b.auction);
 
-    // 2) For each auction sheet file, read rows and filter "outstanding shipments"
-    for (const f of files) {
-      const spreadsheetId = f.id;
+    const allShipments: ShipmentRow[] = [];
 
-      // Most of your sheets are Sheet1; keep it simple
-      const range = "Sheet1!A:Z";
+    // 2) Pull rows from each auction tab and filter shipments
+    for (const tab of auctionTabs) {
+      const range = `'${tab.title.replace(/'/g, "''")}'!A:Z`;
 
-      const valuesRes = await sheets.spreadsheets.values.get({
+      const res = await sheetsApi.spreadsheets.values.get({
         spreadsheetId,
         range,
       });
 
-      const values = (valuesRes.data.values || []) as string[][];
+      const values = res.data.values || [];
       if (values.length < 2) continue;
 
-      const headerRow = values[0].map((h) => norm(h));
+      const headers = (values[0] || []).map((x) => String(x));
+
+      // Flexible header matching (handles small typos / variations)
+      const idxFirst = findHeaderIndex(headers, ["Buyer First Name", "First Name"]);
+      const idxLast = findHeaderIndex(headers, ["Buyer Last Name", "Last Name"]);
+      const idxBid = findHeaderIndex(headers, [
+        "Bidder Number",
+        "Bidder #",
+        "Bid Card",
+        "Bidcard",
+        "Bidcard #",
+        "Bid Card #",
+      ]);
+      const idxLots = findHeaderIndex(headers, ["Lots Bought", "Lots", "Lot Count"]);
+      const idxBalance = findHeaderIndex(headers, ["Balance"]);
+      const idxPay = findHeaderIndex(headers, ["Payment Status", "Paid"]);
+      const idxShipReq = findHeaderIndex(headers, ["Shipping Required", "Ship Required"]);
+      const idxShipped = findHeaderIndex(headers, ["Shipped status", "Shipped Status", "Shipped"]);
+      const idxRefund = findHeaderIndex(headers, ["Refund"]);
+      const idxNotes = findHeaderIndex(headers, ["Notes"]);
+
+      // If we can’t find bidder number, we can’t build shipment records reliably
+      if (idxBid === -1) continue;
+
       const dataRows = values.slice(1);
 
-      const findIdx = (needle: string) =>
-        headerRow.findIndex((h) => h.includes(norm(needle)));
+      for (const row of dataRows) {
+        const get = (i: number) => (i >= 0 ? String(row?.[i] ?? "") : "");
 
-      const bidderIdx = findIdx("bidder number");
-      const firstIdx = findIdx("buyer first name");
-      const lastIdx = findIdx("buyer last name");
-      const lotsIdx = findIdx("lots bought");
-      const payIdx = findIdx("payment status");
-      const shipReqIdx = findIdx("shipping required");
-      const shippedIdx = findIdx("shipped");
-
-      // Need these columns at minimum
-      if (bidderIdx === -1 || payIdx === -1 || shipReqIdx === -1) continue;
-
-      for (const r of dataRows) {
-        const bidcard = (r[bidderIdx] || "").trim();
+        const bidcard = get(idxBid).trim();
         if (!bidcard) continue;
 
-        const payment = r[payIdx] ?? "";
-        const shipReq = r[shipReqIdx] ?? "";
-        const shipped = shippedIdx !== -1 ? r[shippedIdx] ?? "" : "";
+        const firstName = get(idxFirst).trim();
+        const lastName = get(idxLast).trim();
+        const lotsBought = get(idxLots).trim();
+        const balance = get(idxBalance).trim();
+        const paymentStatus = get(idxPay).trim();
+        const shippingRequired = get(idxShipReq).trim();
+        const shippedStatus = get(idxShipped).trim();
+        const refund = get(idxRefund).trim();
+        const notes = get(idxNotes).trim();
 
-        // Outstanding shipment rule:
-        // shipping required = yes
-        // payment status = yes
-        // shipped status = blank (or not yes)
-        if (isYes(shipReq) && isYes(payment) && (isBlank(shipped) || !isYes(shipped))) {
-          shipments.push({
-            auction: f.auction!,
-            bidcard,
-            firstName: firstIdx !== -1 ? (r[firstIdx] || "").trim() : "",
-            lastName: lastIdx !== -1 ? (r[lastIdx] || "").trim() : "",
-            lotsBought: lotsIdx !== -1 ? (r[lotsIdx] || "").trim() : "",
-            paymentStatus: String(payment || "").trim(),
-            shippingRequired: String(shipReq || "").trim(),
-            shippedStatus: String(shipped || "").trim(),
-          });
-        }
+        // Shipment criteria:
+        // shipping required = Y
+        // payment status = Y (or starts with y)
+        // shipped is blank
+        if (!isYes(shippingRequired)) continue;
+        if (!isYes(paymentStatus)) continue;
+        if (!isBlank(shippedStatus)) continue;
+
+        allShipments.push({
+          auction: tab.auction,
+          auctionName: tab.title,
+          bidcard,
+          firstName,
+          lastName,
+          lotsBought,
+          balance,
+          paymentStatus,
+          shippingRequired,
+          shippedStatus,
+          refund,
+          notes,
+        });
       }
     }
 
     return NextResponse.json({
       success: true,
-      auctionsFound: files.length,
-      count: shipments.length,
-      shipments,
+      count: allShipments.length,
+      shipments: allShipments,
     });
-  } catch (err: any) {
+  } catch (error: any) {
     return NextResponse.json(
-      { success: false, error: err?.message || "Unknown error" },
+      { success: false, error: error?.message || "Unknown error" },
       { status: 500 }
     );
   }
 }import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
+/**
+ * Shipments List API
+ * Returns all shipments that should be done:
+ * - Shipping Required = Y
+ * - Payment Status = Y (or starts with "y")
+ * - Shipped Status is blank
+ *
+ * We scan ALL tabs in the Google Sheet whose name looks like "Auction 22"
+ * and treat that number as the auction number.
+ *
+ * ENV REQUIRED:
+ * - GOOGLE_SERVICE_ACCOUNT_JSON  (the JSON string of the service account)
+ * - GOOGLE_SHEET_ID              (the master spreadsheet id)
+ */
+
 function norm(s: string) {
-  return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+  return (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[_-]+/g, " ");
 }
 
-function isYes(v: unknown) {
-  if (v === null || v === undefined) return false;
-  return String(v).trim().toLowerCase().startsWith("y"); // y, Y, y - hibid, etc
+function isYes(v: string | undefined) {
+  const t = (v || "").toString().trim().toLowerCase();
+  return t === "y" || t.startsWith("y ");
 }
 
-function isBlank(v: unknown) {
-  return v === null || v === undefined || String(v).trim() === "";
+function isBlank(v: string | undefined) {
+  return !v || (typeof v === "string" && v.trim() === "");
 }
 
 function getAuth() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
 
-  const creds = JSON.parse(raw);
+  const credentials = JSON.parse(raw);
 
   return new google.auth.GoogleAuth({
-    credentials: creds,
+    credentials,
     scopes: [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       "https://www.googleapis.com/auth/drive.readonly",
@@ -187,130 +250,155 @@ function getAuth() {
   });
 }
 
-function extractAuctionNumber(name: string): number | null {
-  const m = (name || "").match(/(\d+)/);
-  return m ? Number(m[1]) : null;
-}
-
 type ShipmentRow = {
   auction: number;
+  auctionName: string;
   bidcard: string;
   firstName: string;
   lastName: string;
   lotsBought: string;
+  balance: string;
   paymentStatus: string;
   shippingRequired: string;
   shippedStatus: string;
+  refund: string;
+  notes: string;
 };
 
-export async function GET(req: Request) {
+function findHeaderIndex(headers: string[], candidates: string[]) {
+  const normalized = headers.map((h) => norm(h));
+  for (const c of candidates) {
+    const idx = normalized.indexOf(norm(c));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+export async function GET() {
   try {
-    const folderId = process.env.AUCTION_SHEETS_FOLDER_ID;
-    if (!folderId) {
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+    if (!spreadsheetId) {
       return NextResponse.json(
-        { success: false, error: "Missing AUCTION_SHEETS_FOLDER_ID" },
+        { success: false, error: "Missing GOOGLE_SHEET_ID" },
         { status: 500 }
       );
     }
 
     const auth = getAuth();
-    const drive = google.drive({ version: "v3", auth });
-    const sheets = google.sheets({ version: "v4", auth });
+    const sheetsApi = google.sheets({ version: "v4", auth });
 
-    // 1) List all auction spreadsheets in the folder
-    const q = [
-      `'${folderId}' in parents`,
-      `mimeType='application/vnd.google-apps.spreadsheet'`,
-      `trashed=false`,
-    ].join(" and ");
-
-    const listRes = await drive.files.list({
-      q,
-      fields: "files(id,name)",
-      pageSize: 200,
+    // 1) Get all sheet tabs
+    const meta = await sheetsApi.spreadsheets.get({
+      spreadsheetId,
     });
 
-    const files = (listRes.data.files || [])
-      .map((f) => ({
-        id: f.id || "",
-        name: f.name || "",
-        auction: extractAuctionNumber(f.name || ""),
-      }))
-      .filter((f) => f.id && f.auction !== null)
-      .sort((a, b) => (a.auction! - b.auction!));
+    const sheetTitles =
+      meta.data.sheets
+        ?.map((s) => s.properties?.title)
+        .filter((t): t is string => !!t) || [];
 
-    // If this is 0, that means your folder contains no Google Sheets files
-    // with a number in the name.
-    const shipments: ShipmentRow[] = [];
+    // Only tabs that look like "Auction 22" (case-insensitive)
+    const auctionTabs = sheetTitles
+      .map((title) => {
+        const m = title.match(/auction\s*(\d+)/i);
+        if (!m) return null;
+        return {
+          title,
+          auction: Number(m[1]),
+        };
+      })
+      .filter((x): x is { title: string; auction: number } => !!x)
+      .sort((a, b) => a.auction - b.auction);
 
-    // 2) For each auction sheet file, read rows and filter "outstanding shipments"
-    for (const f of files) {
-      const spreadsheetId = f.id;
+    const allShipments: ShipmentRow[] = [];
 
-      // Most of your sheets are Sheet1; keep it simple
-      const range = "Sheet1!A:Z";
+    // 2) Pull rows from each auction tab and filter shipments
+    for (const tab of auctionTabs) {
+      const range = `'${tab.title.replace(/'/g, "''")}'!A:Z`;
 
-      const valuesRes = await sheets.spreadsheets.values.get({
+      const res = await sheetsApi.spreadsheets.values.get({
         spreadsheetId,
         range,
       });
 
-      const values = (valuesRes.data.values || []) as string[][];
+      const values = res.data.values || [];
       if (values.length < 2) continue;
 
-      const headerRow = values[0].map((h) => norm(h));
+      const headers = (values[0] || []).map((x) => String(x));
+
+      // Flexible header matching (handles small typos / variations)
+      const idxFirst = findHeaderIndex(headers, ["Buyer First Name", "First Name"]);
+      const idxLast = findHeaderIndex(headers, ["Buyer Last Name", "Last Name"]);
+      const idxBid = findHeaderIndex(headers, [
+        "Bidder Number",
+        "Bidder #",
+        "Bid Card",
+        "Bidcard",
+        "Bidcard #",
+        "Bid Card #",
+      ]);
+      const idxLots = findHeaderIndex(headers, ["Lots Bought", "Lots", "Lot Count"]);
+      const idxBalance = findHeaderIndex(headers, ["Balance"]);
+      const idxPay = findHeaderIndex(headers, ["Payment Status", "Paid"]);
+      const idxShipReq = findHeaderIndex(headers, ["Shipping Required", "Ship Required"]);
+      const idxShipped = findHeaderIndex(headers, ["Shipped status", "Shipped Status", "Shipped"]);
+      const idxRefund = findHeaderIndex(headers, ["Refund"]);
+      const idxNotes = findHeaderIndex(headers, ["Notes"]);
+
+      // If we can’t find bidder number, we can’t build shipment records reliably
+      if (idxBid === -1) continue;
+
       const dataRows = values.slice(1);
 
-      const findIdx = (needle: string) =>
-        headerRow.findIndex((h) => h.includes(norm(needle)));
+      for (const row of dataRows) {
+        const get = (i: number) => (i >= 0 ? String(row?.[i] ?? "") : "");
 
-      const bidderIdx = findIdx("bidder number");
-      const firstIdx = findIdx("buyer first name");
-      const lastIdx = findIdx("buyer last name");
-      const lotsIdx = findIdx("lots bought");
-      const payIdx = findIdx("payment status");
-      const shipReqIdx = findIdx("shipping required");
-      const shippedIdx = findIdx("shipped");
-
-      // Need these columns at minimum
-      if (bidderIdx === -1 || payIdx === -1 || shipReqIdx === -1) continue;
-
-      for (const r of dataRows) {
-        const bidcard = (r[bidderIdx] || "").trim();
+        const bidcard = get(idxBid).trim();
         if (!bidcard) continue;
 
-        const payment = r[payIdx] ?? "";
-        const shipReq = r[shipReqIdx] ?? "";
-        const shipped = shippedIdx !== -1 ? r[shippedIdx] ?? "" : "";
+        const firstName = get(idxFirst).trim();
+        const lastName = get(idxLast).trim();
+        const lotsBought = get(idxLots).trim();
+        const balance = get(idxBalance).trim();
+        const paymentStatus = get(idxPay).trim();
+        const shippingRequired = get(idxShipReq).trim();
+        const shippedStatus = get(idxShipped).trim();
+        const refund = get(idxRefund).trim();
+        const notes = get(idxNotes).trim();
 
-        // Outstanding shipment rule:
-        // shipping required = yes
-        // payment status = yes
-        // shipped status = blank (or not yes)
-        if (isYes(shipReq) && isYes(payment) && (isBlank(shipped) || !isYes(shipped))) {
-          shipments.push({
-            auction: f.auction!,
-            bidcard,
-            firstName: firstIdx !== -1 ? (r[firstIdx] || "").trim() : "",
-            lastName: lastIdx !== -1 ? (r[lastIdx] || "").trim() : "",
-            lotsBought: lotsIdx !== -1 ? (r[lotsIdx] || "").trim() : "",
-            paymentStatus: String(payment || "").trim(),
-            shippingRequired: String(shipReq || "").trim(),
-            shippedStatus: String(shipped || "").trim(),
-          });
-        }
+        // Shipment criteria:
+        // shipping required = Y
+        // payment status = Y (or starts with y)
+        // shipped is blank
+        if (!isYes(shippingRequired)) continue;
+        if (!isYes(paymentStatus)) continue;
+        if (!isBlank(shippedStatus)) continue;
+
+        allShipments.push({
+          auction: tab.auction,
+          auctionName: tab.title,
+          bidcard,
+          firstName,
+          lastName,
+          lotsBought,
+          balance,
+          paymentStatus,
+          shippingRequired,
+          shippedStatus,
+          refund,
+          notes,
+        });
       }
     }
 
     return NextResponse.json({
       success: true,
-      auctionsFound: files.length,
-      count: shipments.length,
-      shipments,
+      count: allShipments.length,
+      shipments: allShipments,
     });
-  } catch (err: any) {
+  } catch (error: any) {
     return NextResponse.json(
-      { success: false, error: err?.message || "Unknown error" },
+      { success: false, error: error?.message || "Unknown error" },
       { status: 500 }
     );
   }
