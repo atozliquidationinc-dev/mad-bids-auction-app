@@ -1,28 +1,47 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
-type Body = {
-  auction: string;
-  bidcard: string;
-  updates: {
-    paymentStatus?: string;
-    pickupStatus?: string;
-    shippedStatus?: string;
-    refund?: string;
-    notes?: string;
-  };
-};
-
 function mustEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-async function findSheetIdByAuctionName(drive: any, sheetsFolderId: string, auctionName: string) {
-  const safeName = auctionName.replace(/'/g, "\\'");
+function normalizeAuctionName(input: string) {
+  const t = (input || "").trim();
+  if (!t) return "";
+  if (/^\d+$/.test(t)) return `Auction ${t}`;
+  if (/^auction\s+\d+$/i.test(t)) {
+    const num = t.match(/\d+/)?.[0] || "";
+    return `Auction ${num}`;
+  }
+  return t;
+}
+
+function toLowerKey(s: string) {
+  return (s || "").trim().toLowerCase();
+}
+
+function colToLetter(colIndex1: number) {
+  // 1 -> A, 2 -> B ... 27 -> AA
+  let n = colIndex1;
+  let out = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    out = String.fromCharCode(65 + r) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+async function findSheetIdByNameInFolder(
+  drive: any,
+  folderId: string,
+  sheetName: string
+) {
+  const safeName = sheetName.replace(/'/g, "\\'");
   const q = [
-    `'${sheetsFolderId}' in parents`,
+    `'${folderId}' in parents`,
     `mimeType='application/vnd.google-apps.spreadsheet'`,
     `name='${safeName}'`,
     `trashed=false`,
@@ -37,23 +56,29 @@ async function findSheetIdByAuctionName(drive: any, sheetsFolderId: string, auct
   return res.data.files?.[0]?.id || null;
 }
 
-function colToA1(colIdx: number) {
-  let n = colIdx + 1;
-  let s = "";
-  while (n > 0) {
-    const r = (n - 1) % 26;
-    s = String.fromCharCode(65 + r) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
-}
-
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as Body;
-    if (!body?.auction || !body?.bidcard) {
+    const body = await req.json();
+
+    const auctionRaw = body?.auction ?? "";
+    const bidderRaw =
+      body?.bidder ?? body?.bidderNumber ?? body?.bidcard ?? "";
+
+    const updatesRaw = body?.updates ?? {};
+
+    const auctionName = normalizeAuctionName(String(auctionRaw));
+    const bidderNumber = String(bidderRaw || "").trim();
+
+    if (!auctionName || !bidderNumber) {
       return NextResponse.json(
-        { success: false, error: "Missing auction or bidcard" },
+        { success: false, error: "Missing auction or bidder number" },
+        { status: 400 }
+      );
+    }
+
+    if (!updatesRaw || typeof updatesRaw !== "object") {
+      return NextResponse.json(
+        { success: false, error: "Missing updates object" },
         { status: 400 }
       );
     }
@@ -72,100 +97,147 @@ export async function POST(req: Request) {
     const drive = google.drive({ version: "v3", auth });
     const sheets = google.sheets({ version: "v4", auth });
 
-    const spreadsheetId = await findSheetIdByAuctionName(drive, sheetsFolderId, body.auction);
+    // 1) Find the spreadsheet for this auction in your Sheets folder
+    const spreadsheetId = await findSheetIdByNameInFolder(
+      drive,
+      sheetsFolderId,
+      auctionName
+    );
+
     if (!spreadsheetId) {
       return NextResponse.json(
-        { success: false, error: `Sheet not found in Sheets folder: ${body.auction}` },
+        { success: false, error: `Auction sheet not found: ${auctionName}` },
         { status: 404 }
       );
     }
 
+    // 2) Get first tab name (don't assume "Sheet1")
     const meta = await sheets.spreadsheets.get({
       spreadsheetId,
       fields: "sheets(properties(title))",
     });
     const tab = meta.data.sheets?.[0]?.properties?.title;
-    if (!tab) throw new Error("No tabs found in the sheet");
+    if (!tab) throw new Error("No tabs found in auction sheet");
 
-    // Read all rows to find the bidder row + header columns
-    const readRes = await sheets.spreadsheets.values.get({
+    // 3) Read all rows to locate header row + bidder row
+    const read = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `${tab}!A:Z`,
     });
 
-    const rows = (readRes.data.values ?? []) as string[][];
-    if (rows.length < 2) throw new Error("Sheet has no data rows");
-
-    const header = rows[0].map((h) => (h || "").trim());
-    const idx = (name: string) => header.findIndex((h) => h.toLowerCase() === name.toLowerCase());
-
-    const bidderCol = idx("Bidder Number");
-    const paymentCol = idx("Payment Status");
-    const pickupCol = idx("Pickup Status");
-    const shippedCol = idx("Shipped Status");
-    const refundCol = idx("Refund");
-    const notesCol = idx("Notes");
-
-    if (bidderCol === -1) throw new Error("Missing column: Bidder Number");
-    if (paymentCol === -1) throw new Error("Missing column: Payment Status");
-    if (pickupCol === -1) throw new Error("Missing column: Pickup Status");
-    if (shippedCol === -1) throw new Error("Missing column: Shipped Status");
-    if (refundCol === -1) throw new Error("Missing column: Refund");
-    if (notesCol === -1) throw new Error("Missing column: Notes");
-
-    const target = body.bidcard.trim();
-    let rowIndex = -1; // 0-based in rows array
-    for (let i = 1; i < rows.length; i++) {
-      if (String(rows[i]?.[bidderCol] ?? "").trim() === target) {
-        rowIndex = i;
-        break;
-      }
-    }
-    if (rowIndex === -1) {
+    const rows = (read.data.values ?? []) as any[][];
+    if (!rows.length) {
       return NextResponse.json(
-        { success: false, error: `Bidder not found: ${target}` },
-        { status: 404 }
-      );
-    }
-
-    const rowNumber = rowIndex + 1; // 1-based row in sheet tab
-
-    // ONLY allow these fields to be written:
-    const u = body.updates ?? {};
-    const writes: { range: string; values: string[][] }[] = [];
-
-    if (u.paymentStatus !== undefined) {
-      writes.push({ range: `${tab}!${colToA1(paymentCol)}${rowNumber}`, values: [[u.paymentStatus]] });
-    }
-    if (u.pickupStatus !== undefined) {
-      writes.push({ range: `${tab}!${colToA1(pickupCol)}${rowNumber}`, values: [[u.pickupStatus]] });
-    }
-    if (u.shippedStatus !== undefined) {
-      writes.push({ range: `${tab}!${colToA1(shippedCol)}${rowNumber}`, values: [[u.shippedStatus]] });
-    }
-    if (u.refund !== undefined) {
-      writes.push({ range: `${tab}!${colToA1(refundCol)}${rowNumber}`, values: [[u.refund]] });
-    }
-    if (u.notes !== undefined) {
-      writes.push({ range: `${tab}!${colToA1(notesCol)}${rowNumber}`, values: [[u.notes]] });
-    }
-
-    if (writes.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "No editable fields provided" },
+        { success: false, error: "Sheet is empty" },
         { status: 400 }
       );
     }
 
+    // 4) Find header row containing "Bidder Number"
+    let headerRowIndex = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const normalized = (rows[i] || []).map((x) => toLowerKey(String(x ?? "")));
+      if (normalized.includes("bidder number")) {
+        headerRowIndex = i;
+        break;
+      }
+    }
+
+    if (headerRowIndex === -1) {
+      return NextResponse.json(
+        { success: false, error: 'Could not find header row ("Bidder Number")' },
+        { status: 400 }
+      );
+    }
+
+    const header = (rows[headerRowIndex] || []).map((h) => String(h ?? "").trim());
+    const headerLower = header.map((h) => toLowerKey(h));
+
+    const bidderColIndex0 = headerLower.indexOf("bidder number");
+    if (bidderColIndex0 === -1) {
+      return NextResponse.json(
+        { success: false, error: 'Missing column: "Bidder Number"' },
+        { status: 400 }
+      );
+    }
+
+    // 5) Find bidder row
+    let bidderRowIndex = -1;
+    for (let i = headerRowIndex + 1; i < rows.length; i++) {
+      const cell = String(rows[i]?.[bidderColIndex0] ?? "").trim();
+      if (cell === bidderNumber) {
+        bidderRowIndex = i;
+        break;
+      }
+    }
+
+    if (bidderRowIndex === -1) {
+      return NextResponse.json(
+        { success: false, error: `Bidder not found: ${bidderNumber}` },
+        { status: 404 }
+      );
+    }
+
+    const sheetRowNumber = bidderRowIndex + 1; // 1-based row number in Sheets
+
+    // 6) Map updates keys to real header names (case-insensitive match)
+    const updates: Record<string, string> = {};
+    for (const [k, v] of Object.entries(updatesRaw)) {
+      updates[String(k)] = String(v ?? "");
+    }
+
+    const missingCols: string[] = [];
+    const batchData: { range: string; values: any[][] }[] = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      const keyLower = toLowerKey(key);
+
+      // find matching header by lowercase
+      const colIndex0 = headerLower.indexOf(keyLower);
+
+      if (colIndex0 === -1) {
+        missingCols.push(key);
+        continue;
+      }
+
+      const colLetter = colToLetter(colIndex0 + 1);
+      batchData.push({
+        range: `${tab}!${colLetter}${sheetRowNumber}`,
+        values: [[value]],
+      });
+    }
+
+    if (batchData.length === 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "No valid columns found to update. Check your column names.",
+          missingColumns: missingCols,
+        },
+        { status: 400 }
+      );
+    }
+
+    // 7) Write updates
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
-      requestBody: { valueInputOption: "USER_ENTERED", data: writes },
+      requestBody: {
+        valueInputOption: "RAW",
+        data: batchData,
+      },
     });
 
-    return NextResponse.json({ success: true, updated: writes.length });
+    return NextResponse.json({
+      success: true,
+      auctionName,
+      bidderNumber,
+      updated: Object.keys(updates),
+      missingColumns: missingCols,
+    });
   } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: e?.message ?? "Unknown error" },
+      { success: false, error: e?.message || "Unknown error" },
       { status: 500 }
     );
   }
