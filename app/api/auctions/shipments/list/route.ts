@@ -1,22 +1,10 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
-function norm(s: unknown) {
-  return String(s ?? "")
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function isYes(v: unknown) {
-  const x = norm(v);
-  return x === "y" || x === "yes" || x === "true" || x === "1";
-}
-
 function getAuth() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-  const credentials = JSON.parse(raw);
+  const credentials = JSON.parse(
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON as string
+  );
   return new google.auth.GoogleAuth({
     credentials,
     scopes: [
@@ -26,17 +14,37 @@ function getAuth() {
   });
 }
 
-function parseAuctionNumber(name: string) {
-  // accepts: "Auction 22", "auction22", "22"
-  const m = String(name).match(/(\d+)/);
-  return m ? Number(m[1]) : null;
+function norm(s: any) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+// Treat ANY value starting with "y" as YES (handles: "y", "y - hibid", "y ", "Y", etc)
+function isYes(v: any) {
+  const t = norm(v);
+  return t.startsWith("y");
+}
+
+function findHeaderRow(rows: any[][]) {
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    const row = rows[i] || [];
+    const joined = row.map(norm).join("|");
+    if (
+      joined.includes("bidder number") ||
+      joined.includes("bidcard") ||
+      joined.includes("shipping required") ||
+      joined.includes("payment status")
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 export async function GET(req: Request) {
   try {
-    const url = new URL(req.url);
-    const debug = url.searchParams.get("debug") === "1";
-
     const spreadsheetId = process.env.GOOGLE_SHEET_ID;
     if (!spreadsheetId) {
       return NextResponse.json(
@@ -45,97 +53,118 @@ export async function GET(req: Request) {
       );
     }
 
+    const url = new URL(req.url);
+    const auctionParam = url.searchParams.get("auction"); // optional
+    const auctionNumber = auctionParam ? Number(auctionParam) : null;
+
     const auth = getAuth();
     const sheets = google.sheets({ version: "v4", auth });
 
-    // Reads the whole sheet (same as your bidder lookup)
+    // Read a wide range so we can detect the header row even if row 1 is blank
     const range = "Sheet1!A:Z";
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId, range });
-    const rows = res.data.values || [];
-    if (rows.length < 2) {
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range });
+
+    const rows = (resp.data.values || []) as any[][];
+    if (!rows.length) {
       return NextResponse.json({ success: true, count: 0, shipments: [] });
     }
 
-    const headers = rows[1].map((h) => norm(h));
-    const dataRows = rows.slice(2);
-
-    const idx = (name: string) => headers.indexOf(norm(name));
-
-    const iFirst = idx("buyer first name");
-    const iLast = idx("buyer last name");
-    const iBid = idx("bidder number");
-    const iLots = idx("lots bought");
-    const iPay = idx("payment status");
-    const iShipReq = idx("shipping required");
-    const iShipped = idx("shipped status");
-
-    const missing = [];
-    if (iBid === -1) missing.push("Bidder Number");
-    if (iPay === -1) missing.push("Payment Status");
-    if (iShipReq === -1) missing.push("Shipping Required");
-    if (iShipped === -1) missing.push("Shipped status");
-
-    if (missing.length) {
+    const headerRowIndex = findHeaderRow(rows);
+    if (headerRowIndex === -1) {
       return NextResponse.json(
         {
           success: false,
-          error: `Missing column(s): ${missing.join(", ")}`,
-          headers: debug ? rows[1] : undefined,
+          error:
+            "Could not find header row. Make sure the sheet has columns like Bidder Number, Payment Status, Shipping Required, Shipped status.",
         },
         { status: 500 }
       );
     }
 
-    // A shipment we want:
-    // shipping required = Y
-    // payment status = Y
-    // shipped status is blank
+    const headers = rows[headerRowIndex].map(norm);
+
+    const idx = (name: string) => headers.indexOf(norm(name));
+
+    // Required columns (we accept common variations)
+    const bidderIdx =
+      idx("Bidder Number") !== -1
+        ? idx("Bidder Number")
+        : idx("Bidcard") !== -1
+        ? idx("Bidcard")
+        : -1;
+
+    const firstIdx = idx("Buyer First Name");
+    const lastIdx = idx("Buyer Last Name");
+    const lotsIdx = idx("Lots Bought");
+
+    const paymentIdx = idx("Payment Status");
+    const shipReqIdx = idx("Shipping Required");
+    const shippedIdx =
+      idx("Shipped status") !== -1 ? idx("Shipped status") : idx("Shipped");
+
+    if (bidderIdx === -1) {
+      return NextResponse.json(
+        { success: false, error: "Missing column: Bidder Number" },
+        { status: 500 }
+      );
+    }
+    if (paymentIdx === -1) {
+      return NextResponse.json(
+        { success: false, error: "Missing column: Payment Status" },
+        { status: 500 }
+      );
+    }
+    if (shipReqIdx === -1) {
+      return NextResponse.json(
+        { success: false, error: "Missing column: Shipping Required" },
+        { status: 500 }
+      );
+    }
+    if (shippedIdx === -1) {
+      return NextResponse.json(
+        { success: false, error: "Missing column: Shipped status" },
+        { status: 500 }
+      );
+    }
+
+    const dataRows = rows.slice(headerRowIndex + 1);
+
     const shipments = dataRows
-      .map((row) => {
-        const bidcard = String(row[iBid] ?? "").trim();
-        const first = String(row[iFirst] ?? "").trim();
-        const last = String(row[iLast] ?? "").trim();
-        const lots = String(row[iLots] ?? "").trim();
+      .map((r) => {
+        const bidderNumber = String(r[bidderIdx] ?? "").trim();
+        if (!bidderNumber) return null;
 
-        const payYes = isYes(row[iPay]);
-        const shipReqYes = isYes(row[iShipReq]);
-        const shippedYes = isYes(row[iShipped]);
-        const shippedBlank = norm(row[iShipped]) === "";
+        const payment = r[paymentIdx];
+        const shipReq = r[shipReqIdx];
+        const shipped = r[shippedIdx];
 
-        // auction number: try to infer from any "Auction" text in row, otherwise null
-        // (you can improve later; list sorting will still work with nulls)
-        const auctionNum = null;
+        const paymentYes = isYes(payment);
+        const shipReqYes = isYes(shipReq);
+        const shippedYes = isYes(shipped);
+
+        // Outstanding shipments:
+        // - shipping required YES
+        // - payment YES
+        // - shipped is blank / not yes
+        if (!(shipReqYes && paymentYes && !shippedYes)) return null;
 
         return {
-          bidcard,
-          first,
-          last,
-          lots,
-          payYes,
-          shipReqYes,
-          shippedYes,
-          shippedBlank,
-          auctionNum,
+          auction: auctionNumber ?? 0, // if you don’t have auction in the sheet, we leave 0 (frontend can still sort)
+          bidderNumber,
+          firstName: firstIdx !== -1 ? String(r[firstIdx] ?? "").trim() : "",
+          lastName: lastIdx !== -1 ? String(r[lastIdx] ?? "").trim() : "",
+          lots: lotsIdx !== -1 ? String(r[lotsIdx] ?? "").trim() : "",
+          paymentStatus: String(payment ?? "").trim(),
+          shippingRequired: String(shipReq ?? "").trim(),
+          shippedStatus: String(shipped ?? "").trim(),
         };
       })
-      .filter(
-        (x) =>
-          x.bidcard &&
-          x.shipReqYes &&
-          x.payYes &&
-          x.shippedBlank // shipped is empty
-      );
+      .filter(Boolean);
 
     return NextResponse.json({
       success: true,
       count: shipments.length,
       shipments,
-      debug: debug
-        ? {
-            headerRow: rows[1],
-            normalizedHeaders: headers,
-          }
-        : undefined,
     });
   } catch (err: any) {
     return NextResponse.json(
