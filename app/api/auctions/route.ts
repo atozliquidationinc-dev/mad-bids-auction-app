@@ -7,10 +7,7 @@ export async function GET() {
       credentials: JSON.parse(
         process.env.GOOGLE_SERVICE_ACCOUNT_JSON as string
       ),
-      scopes: [
-  "https://www.googleapis.com/auth/spreadsheets",
-  "https://www.googleapis.com/auth/drive.readonly",
-],
+  
 
 
 
