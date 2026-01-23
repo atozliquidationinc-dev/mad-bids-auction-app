@@ -1,10 +1,25 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
+// -------- helpers --------
+function normHeader(h: string) {
+  return h.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function yes(v: any) {
+  const s = String(v ?? "").trim().toLowerCase();
+  // treat: "y", "y ", "y - hibid", "yes" as YES
+  return s === "y" || s.startsWith("y ") || s.startsWith("y-") || s === "yes";
+}
+
+function numFromName(name: string) {
+  const m = name.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 999999;
+}
+
 function getAuth() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-
   const credentials = JSON.parse(raw);
 
   return new google.auth.GoogleAuth({
@@ -16,38 +31,14 @@ function getAuth() {
   });
 }
 
-/**
- * Extracts an auction number from ANY name:
- * "Auction 22" -> 22
- * "22" -> 22
- * "mad bids auction-23" -> 23
- */
-function extractAuctionNumber(name: string): number | null {
-  if (!name) return null;
-
-  // Find the first 1-4 digit number in the string
-  const match = name.match(/(\d{1,4})/);
-  if (!match) return null;
-
-  const n = Number(match[1]);
-  return Number.isFinite(n) ? n : null;
-}
-
-function norm(v: any): string {
-  return String(v ?? "").trim();
-}
-
-function isYes(v: any): boolean {
-  // Treat: "y", "Y", "y - hibid", "y ", etc. as YES
-  const s = norm(v).toLowerCase();
-  return s.startsWith("y");
-}
-
+// -------- route --------
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const sort = url.searchParams.get("sort") || "auction_asc";
+
+    // search + sort
     const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+    const sort = (url.searchParams.get("sort") || "auctionAsc").trim();
 
     const sheetsFolderId = process.env.AUCTION_SHEETS_FOLDER_ID;
     if (!sheetsFolderId) {
@@ -57,144 +48,142 @@ export async function GET(req: Request) {
       );
     }
 
+    const range = process.env.AUCTION_SHEET_RANGE || "Sheet1!A:Z";
+
     const auth = getAuth();
     const drive = google.drive({ version: "v3", auth });
-    const sheetsApi = google.sheets({ version: "v4", auth });
+    const sheets = google.sheets({ version: "v4", auth });
 
-    // 1) List all Google Sheets inside AUCTION_SHEETS_FOLDER_ID
+    // list auction sheet files in the folder
     const listRes = await drive.files.list({
-      q: `'${sheetsFolderId}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
+      q: [
+        `'${sheetsFolderId}' in parents`,
+        `mimeType='application/vnd.google-apps.spreadsheet'`,
+        `trashed=false`,
+      ].join(" and "),
       fields: "files(id,name)",
       pageSize: 200,
     });
 
     const files = listRes.data.files || [];
 
-    // 2) For each auction sheet, read rows and extract shipments
-    const shipments: Array<{
-      auction: number;
-      auctionName: string;
-      bidcard: string;
-      firstName: string;
-      lastName: string;
-      phone: string;
-      lots: number;
-      invoiceBidcard: string;
-      paymentYes: boolean;
-      shippingRequiredYes: boolean;
-      shippedYes: boolean;
-    }> = [];
+    const shipments: any[] = [];
 
     for (const f of files) {
-      const sheetId = f.id!;
-      const sheetName = f.name || "";
+      const fileId = f.id!;
+      const fileName = f.name || "Auction";
 
-      const auctionNumber = extractAuctionNumber(sheetName);
-      if (!auctionNumber) {
-        // Skip sheets we can't identify
-        continue;
-      }
-
-      // Read a wide range (same style we used before)
-      const valuesRes = await sheetsApi.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: "Sheet1!A:Z",
+      const valuesRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: fileId,
+        range,
       });
 
       const rows = valuesRes.data.values || [];
-      if (rows.length < 2) continue;
+      if (!rows.length) continue;
 
-      const headers = (rows[1] || []).map((h) => norm(h));
-
-      const idx = (colName: string) =>
-        headers.findIndex(
-          (h) => h.toLowerCase() === colName.toLowerCase()
-        );
-
-      const iFirst = idx("Buyer First Name");
-      const iLast = idx("Buyer Last Name");
-      const iBidder = idx("Bidder Number");
-      const iPhone = idx("Buyer Phone");
-      const iLots = idx("Lots Bought");
-      const iPay = idx("Payment Status");
-      const iShipReq = idx("Shipping Required");
-      const iShipped = idx("Shipped status"); // your sheet uses this case
-      if (iShipped === -1) {
-        // sometimes it might be "Shipped Status"
-        // so we try again via contains
+      // find the header row (first row that contains "bidder number")
+      let headerRowIndex = -1;
+      for (let i = 0; i < Math.min(rows.length, 10); i++) {
+        const r = rows[i] || [];
+        const joined = r.map((x) => normHeader(String(x ?? ""))).join("|");
+        if (joined.includes("bidder number")) {
+          headerRowIndex = i;
+          break;
+        }
       }
-      const iShipped2 =
+      if (headerRowIndex === -1) continue;
+
+      const headerRow = rows[headerRowIndex].map((h) => normHeader(String(h ?? "")));
+      const dataRows = rows.slice(headerRowIndex + 1);
+
+      const idx = (name: string) => headerRow.indexOf(normHeader(name));
+
+      const iFirst = idx("buyer first name");
+      const iLast = idx("buyer last name");
+      const iBidder = idx("bidder number");
+      const iLots = idx("lots bought");
+      const iBalance = idx("balance");
+      const iPay = idx("payment status");
+      const iShipReq = idx("shipping required");
+      const iShipped = idx("shipped status"); // handle both spellings below
+      const iShipped2 = idx("shipped status "); // just in case trailing space
+      const iShipped3 = idx("shipped status"); // redundant but harmless
+      const iShippedAlt = idx("shipped status"); // keep
+
+      // also accept "shipped status" / "shipped status" / "shipped status"
+      const shippedIndex =
         iShipped !== -1
           ? iShipped
-          : headers.findIndex((h) => h.toLowerCase().includes("shipped"));
+          : headerRow.findIndex((h) => h === "shipped status" || h === "shipped status");
 
-      // If we can't even find bidder number, we can't build shipments list
-      if (iBidder === -1) continue;
+      // If you used "Shipped status" exactly in your sheet, it normalizes to "shipped status" and will match.
 
-      for (let r = 2; r < rows.length; r++) {
-        const row = rows[r] || [];
+      // REQUIRE these to exist
+      if (iBidder === -1 || iPay === -1 || iShipReq === -1) continue;
 
-        const bidcard = norm(row[iBidder]);
-        if (!bidcard) continue;
+      for (const r of dataRows) {
+        if (!r || r.length === 0) continue;
 
-        const firstName = iFirst !== -1 ? norm(row[iFirst]) : "";
-        const lastName = iLast !== -1 ? norm(row[iLast]) : "";
-        const phone = iPhone !== -1 ? norm(row[iPhone]) : "";
+        const first = iFirst !== -1 ? String(r[iFirst] ?? "").trim() : "";
+        const last = iLast !== -1 ? String(r[iLast] ?? "").trim() : "";
+        const bidder = String(r[iBidder] ?? "").trim();
 
-        const lotsRaw = iLots !== -1 ? norm(row[iLots]) : "0";
-        const lots = Number(lotsRaw) || 0;
+        if (!bidder) continue;
 
-        const paymentYes = iPay !== -1 ? isYes(row[iPay]) : false;
-        const shippingRequiredYes =
-          iShipReq !== -1 ? isYes(row[iShipReq]) : false;
+        const lots = iLots !== -1 ? Number(String(r[iLots] ?? "0").trim() || "0") : 0;
+        const balance = iBalance !== -1 ? String(r[iBalance] ?? "").trim() : "";
 
-        const shippedVal = iShipped2 !== -1 ? row[iShipped2] : "";
-        const shippedYes = isYes(shippedVal);
+        const paymentOk = yes(r[iPay]);
+        const shippingRequired = yes(r[iShipReq]);
 
-        // SHIPMENTS SHIFT RULE:
-        // shipping required = YES
-        // payment status = YES
-        // shipped status = BLANK (not YES)
-        if (shippingRequiredYes && paymentYes && !shippedYes) {
-          // invoice uses bidcard as filename (20000.pdf)
+        // shipped column might be missing or blank; treat missing as NOT shipped
+        const shippedVal =
+          shippedIndex !== -1 ? r[shippedIndex] : (headerRow.includes("shipped status") ? "" : "");
+        const shippedOk = yes(shippedVal);
+
+        // our rule: show shipments only if shippingRequired + paymentOk + NOT shipped
+        if (shippingRequired && paymentOk && !shippedOk) {
           shipments.push({
-            auction: auctionNumber,
-            auctionName: sheetName,
-            bidcard,
-            firstName,
-            lastName,
-            phone,
-            lots,
-            invoiceBidcard: bidcard,
-            paymentYes,
-            shippingRequiredYes,
-            shippedYes,
+            auctionName: fileName,
+            auctionNumber: numFromName(fileName),
+            bidderNumber: bidder,
+            buyerFirstName: first,
+            buyerLastName: last,
+            lotsBought: lots,
+            balance,
+            paymentStatus: r[iPay],
+            shippingRequired: r[iShipReq],
+            shippedStatus: shippedVal ?? "",
           });
         }
       }
     }
 
-    // 3) Apply search filter
-    const filtered = q
-      ? shipments.filter((s) => {
-          const blob = `${s.firstName} ${s.lastName} ${s.bidcard}`.toLowerCase();
-          return blob.includes(q);
-        })
-      : shipments;
+    // filter by search (name or bidder)
+    let filtered = shipments;
+    if (q) {
+      filtered = filtered.filter((s) => {
+        const full = `${s.buyerFirstName} ${s.buyerLastName}`.toLowerCase();
+        return (
+          full.includes(q) ||
+          String(s.bidderNumber || "").toLowerCase().includes(q)
+        );
+      });
+    }
 
-    // 4) Sorting
-    const sorted = [...filtered].sort((a, b) => {
-      if (sort === "auction_desc") return b.auction - a.auction;
-      if (sort === "lots_asc") return a.lots - b.lots;
-      if (sort === "lots_desc") return b.lots - a.lots;
-      // default: auction_asc
-      return a.auction - b.auction;
+    // sort
+    filtered.sort((a, b) => {
+      if (sort === "auctionDesc") return b.auctionNumber - a.auctionNumber;
+      if (sort === "lotsAsc") return (a.lotsBought || 0) - (b.lotsBought || 0);
+      if (sort === "lotsDesc") return (b.lotsBought || 0) - (a.lotsBought || 0);
+      // default: auctionAsc
+      return a.auctionNumber - b.auctionNumber;
     });
 
     return NextResponse.json({
       success: true,
-      count: sorted.length,
-      shipments: sorted,
+      count: filtered.length,
+      shipments: filtered,
     });
   } catch (err: any) {
     return NextResponse.json(
