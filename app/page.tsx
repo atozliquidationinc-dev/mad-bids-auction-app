@@ -30,9 +30,7 @@ const EDITABLE_FIELDS = [
 function auctionNameFromNumber(auctionNumber: string) {
   const t = (auctionNumber || "").trim();
   if (!t) return "";
-  // If user typed "22" -> "Auction 22"
   if (/^\d+$/.test(t)) return `Auction ${t}`;
-  // If they typed "Auction 22" anyway, keep it
   if (/^auction\s+\d+$/i.test(t)) {
     const num = t.match(/\d+/)?.[0] || "";
     return `Auction ${num}`;
@@ -40,12 +38,109 @@ function auctionNameFromNumber(auctionNumber: string) {
   return t;
 }
 
+function isY(v: string | undefined | null) {
+  return (v ?? "").trim().toLowerCase() === "y";
+}
+
+function isEmpty(v: string | undefined | null) {
+  return (v ?? "").trim().length === 0;
+}
+
+function StatusPill({
+  value,
+  emptyLabel = "NO",
+  yLabel = "YES",
+}: {
+  value: string;
+  emptyLabel?: string;
+  yLabel?: string;
+}) {
+  const on = isY(value);
+  const text = on ? yLabel : emptyLabel;
+
+  // Aesthetic hues: emerald + rose on dark background
+  const style: React.CSSProperties = on
+    ? {
+        display: "inline-block",
+        padding: "6px 10px",
+        borderRadius: 999,
+        background: "rgba(16, 185, 129, 0.18)", // emerald
+        border: "1px solid rgba(16, 185, 129, 0.35)",
+        color: "rgba(167, 243, 208, 1)",
+        fontSize: 12,
+        fontWeight: 800,
+        letterSpacing: 0.6,
+      }
+    : {
+        display: "inline-block",
+        padding: "6px 10px",
+        borderRadius: 999,
+        background: "rgba(244, 63, 94, 0.16)", // rose
+        border: "1px solid rgba(244, 63, 94, 0.35)",
+        color: "rgba(254, 205, 211, 1)",
+        fontSize: 12,
+        fontWeight: 800,
+        letterSpacing: 0.6,
+      };
+
+  return <span style={style}>{text}</span>;
+}
+
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+}) {
+  // Mobile-friendly toggle with red/green glow
+  return (
+    <button
+      type="button"
+      onClick={() => !disabled && onChange(!checked)}
+      aria-pressed={checked}
+      style={{
+        width: 72,
+        height: 38,
+        borderRadius: 999,
+        border: "1px solid rgba(255,255,255,0.12)",
+        background: checked
+          ? "rgba(16, 185, 129, 0.25)"
+          : "rgba(244, 63, 94, 0.22)",
+        boxShadow: checked
+          ? "0 0 0 4px rgba(16,185,129,0.10)"
+          : "0 0 0 4px rgba(244,63,94,0.10)",
+        position: "relative",
+        padding: 0,
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      <span
+        style={{
+          position: "absolute",
+          top: 3,
+          left: checked ? 36 : 3,
+          width: 32,
+          height: 32,
+          borderRadius: 999,
+          background: "#0b0d12",
+          border: "1px solid rgba(255,255,255,0.14)",
+          transition: "left 120ms ease",
+        }}
+      />
+    </button>
+  );
+}
+
 export default function Page() {
-  const [auctionNumber, setAuctionNumber] = useState(""); // user types: 22
-  const [bidcard, setBidcard] = useState(""); // user types: 20000
+  const [auctionNumber, setAuctionNumber] = useState("");
+  const [bidcard, setBidcard] = useState("");
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savingPickup, setSavingPickup] = useState(false);
 
   const [record, setRecord] = useState<BidderRecord | null>(null);
   const [invoiceLink, setInvoiceLink] = useState<string | null>(null);
@@ -79,7 +174,7 @@ export default function Page() {
     const cleanBidcard = bidcard.trim();
 
     try {
-      // Bidder data from Sheets (we send both bidder + bidderNumber + bidcard to be safe)
+      // Bidder lookup (send multiple param names to match your backend variants)
       const bidderUrl =
         `/api/auctions/bidder?` +
         `auction=${encodeURIComponent(cleanAuctionName)}` +
@@ -101,7 +196,7 @@ export default function Page() {
       for (const f of EDITABLE_FIELDS) initialEdits[f] = rec[f] ?? "";
       setEditValues(initialEdits);
 
-      // Invoice from Drive (your invoice route expects auction + bidcard)
+      // Invoice lookup (your invoice route expects auction + bidcard)
       const invoiceUrl =
         `/api/auctions/invoice?` +
         `auction=${encodeURIComponent(cleanAuctionName)}` +
@@ -119,6 +214,29 @@ export default function Page() {
     }
   }
 
+  async function saveUpdates(updates: Record<string, string>) {
+    const cleanAuctionName = auctionName.trim();
+    const cleanBidcard = bidcard.trim();
+
+    const res = await fetch(`/api/auctions/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        auction: cleanAuctionName,
+        bidder: cleanBidcard,
+        bidcard: cleanBidcard,
+        bidderNumber: cleanBidcard,
+        updates,
+      }),
+    });
+
+    const json = await res.json();
+    if (!res.ok || json?.success === false) {
+      throw new Error(json?.error || "Update failed");
+    }
+  }
+
   async function handleSaveEdits() {
     if (!record) return;
 
@@ -127,27 +245,7 @@ export default function Page() {
     setNotice(null);
 
     try {
-      const cleanAuctionName = auctionName.trim();
-      const cleanBidcard = bidcard.trim();
-
-      const res = await fetch(`/api/auctions/update`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({
-          auction: cleanAuctionName,
-          bidder: cleanBidcard,
-          bidcard: cleanBidcard,
-          bidderNumber: cleanBidcard,
-          updates: editValues,
-        }),
-      });
-
-      const json = await res.json();
-      if (!res.ok || json?.success === false) {
-        throw new Error(json?.error || "Update failed");
-      }
-
+      await saveUpdates(editValues);
       setNotice("Saved ✅");
       await handleSearch();
     } catch (e: any) {
@@ -156,6 +254,35 @@ export default function Page() {
       setSaving(false);
     }
   }
+
+  // ✅ Instant-save pickup toggle
+  async function handlePickupToggle(nextOn: boolean) {
+    if (!record) return;
+
+    setSavingPickup(true);
+    setError(null);
+    setNotice(null);
+
+    const nextValue = nextOn ? "Y" : "";
+
+    // Update UI immediately (optimistic)
+    setEditValues((prev) => ({ ...prev, ["Pickup status"]: nextValue }));
+
+    try {
+      await saveUpdates({ ["Pickup status"]: nextValue });
+      setNotice(nextOn ? "Pickup marked ✅" : "Pickup cleared ⚠️");
+      await handleSearch();
+    } catch (e: any) {
+      // revert on failure
+      setEditValues((prev) => ({ ...prev, ["Pickup status"]: record["Pickup status"] ?? "" }));
+      setError(e?.message || "Failed to update pickup");
+    } finally {
+      setSavingPickup(false);
+    }
+  }
+
+  const pickupY = isY(editValues["Pickup status"] ?? record?.["Pickup status"]);
+  const paymentY = isY(record?.["Payment Status"] ?? "");
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100">
@@ -171,6 +298,7 @@ export default function Page() {
       </div>
 
       <div className="mx-auto w-full max-w-md px-4 py-5">
+        {/* Search */}
         <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4 shadow">
           <div className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
             Search
@@ -219,6 +347,7 @@ export default function Page() {
 
         {record && (
           <div className="mt-4 space-y-4">
+            {/* Invoice */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Invoice</div>
               {invoiceLink ? (
@@ -237,25 +366,63 @@ export default function Page() {
               )}
             </div>
 
+            {/* Buyer Info */}
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Buyer Info</div>
+
+              {/* Highlight pills */}
+              <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                <div>
+                  <div className="text-xs text-neutral-400">Payment</div>
+                  <StatusPill value={record["Payment Status"] ?? ""} emptyLabel="NOT PAID" yLabel="PAID" />
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-400">Picked Up</div>
+                  <StatusPill value={record["Pickup status"] ?? ""} emptyLabel="NOT PICKED" yLabel="PICKED" />
+                </div>
+              </div>
+
               <div className="mt-3 space-y-2">
-                {VIEW_FIELDS.map((k) => (
-                  <div
-                    key={k}
-                    className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
-                  >
-                    <div className="text-xs text-neutral-400">{k}</div>
-                    <div className="text-sm text-neutral-100">{record[k] ?? ""}</div>
-                  </div>
-                ))}
+                {VIEW_FIELDS.map((k) => {
+                  // For these two we already show pills, but still show raw value below for transparency
+                  const val = record[k] ?? "";
+                  const isSpecial = k === "Payment Status" || k === "Pickup status";
+                  return (
+                    <div
+                      key={k}
+                      className="rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2"
+                    >
+                      <div className="text-xs text-neutral-400">{k}</div>
+                      <div className="text-sm text-neutral-100">
+                        {isSpecial ? (isEmpty(val) ? "—" : val) : val}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
+            {/* Update Status */}
             <div className="rounded-2xl border border-red-900/40 bg-neutral-900/60 p-4">
               <div className="text-sm font-bold text-neutral-100">Update Status</div>
+
+              {/* Pickup toggle (instant save) */}
+              <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3">
+                <div className="text-xs text-neutral-400">Pickup status</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                  <div className="text-sm text-neutral-100">
+                    {pickupY ? "Y (Picked up)" : "Blank (Not picked up)"}
+                  </div>
+                  <Toggle checked={pickupY} onChange={handlePickupToggle} disabled={savingPickup} />
+                </div>
+                <div className="mt-2 text-xs text-neutral-400">
+                  Toggling updates the sheet immediately.
+                </div>
+              </div>
+
+              {/* Other editable fields stay as inputs */}
               <div className="mt-3 space-y-3">
-                {EDITABLE_FIELDS.map((k) => (
+                {EDITABLE_FIELDS.filter((f) => f !== "Pickup status").map((k) => (
                   <div key={k}>
                     <div className="text-xs text-neutral-400">{k}</div>
                     <input
