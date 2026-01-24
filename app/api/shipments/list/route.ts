@@ -42,7 +42,8 @@ function extractAuctionNumber(name: string) {
   return m?.[1] ?? "";
 }
 
-async function listAllSpreadsheetsInFolder(drive: any, folderId: string) {
+async function listAllSpreadsheetsInFolder(drive: ReturnType<typeof google.drive>, folderId: string) {
+
   const out: { id: string; name: string }[] = [];
   let pageToken: string | undefined = undefined;
 
@@ -53,7 +54,8 @@ async function listAllSpreadsheetsInFolder(drive: any, folderId: string) {
   ].join(" and ");
 
   do {
-    const res = await drive.files.list({
+    const res: any = await drive.files.list({
+
       q,
       fields: "nextPageToken,files(id,name)",
       pageSize: 100,
@@ -68,14 +70,16 @@ async function listAllSpreadsheetsInFolder(drive: any, folderId: string) {
   return out;
 }
 
-async function buildInvoiceUrlMap(drive: any, folderId: string) {
+async function buildInvoiceUrlMap(drive: ReturnType<typeof google.drive>, folderId: string) {
+
   const map = new Map<string, string>();
   let pageToken: string | undefined = undefined;
 
   const q = [`'${folderId}' in parents`, `mimeType='application/pdf'`, `trashed=false`].join(" and ");
 
   do {
-    const res = await drive.files.list({
+    const res: any = await drive.files.list({
+
       q,
       fields: "nextPageToken,files(id,name,webViewLink,webContentLink)",
       pageSize: 1000,
