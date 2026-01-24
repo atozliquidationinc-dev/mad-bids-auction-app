@@ -45,20 +45,23 @@ function colLetter(colIndexZeroBased: number) {
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    const body = await req.json().catch(() => null);
+    if (!body) {
+      return NextResponse.json({ success: false, error: "Invalid JSON body" }, { status: 400 });
+    }
 
     const sheetId = String(body.sheetId || "");
-    const rowNumber = Number(body.rowNumber);
 
-    const paymentStatus = body.paymentStatus === "Y" ? "Y" : "";
-    const shippingRequired = body.shippingRequired === "Y" ? "Y" : "";
-    const shippedStatus = body.shippedStatus === "Y" ? "Y" : "";
+    // Support BOTH payload shapes:
+    // (A) UI shape: { sheetId, row, field, value }
+    // (B) Legacy: { sheetId, rowNumber, paymentStatus, shippingRequired, shippedStatus }
+    const row = Number(body.row ?? body.rowNumber);
 
-    if (!sheetId || !Number.isFinite(rowNumber) || rowNumber < 2) {
-      return NextResponse.json(
-        { success: false, error: "Missing/invalid sheetId or rowNumber" },
-        { status: 400 }
-      );
+    const field = body.field as ("paymentStatus" | "shippingRequired" | "shippedStatus" | undefined);
+    const value = String(body.value ?? "");
+
+    if (!sheetId || !Number.isFinite(row) || row < 2) {
+      return NextResponse.json({ success: false, error: "Missing/invalid sheetId or row" }, { status: 400 });
     }
 
     const tabName = process.env.SHEET_TAB_NAME || "Sheet1";
@@ -76,31 +79,51 @@ export async function POST(req: Request) {
 
     const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
     const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-    const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status"]);
+    const idxShipped = pickHeaderIndex(headers, [
+      "shipped status",
+      "shipping status",
+      "shipped",
+      "ship status",
+      "shipment status",
+    ]);
 
-    if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) {
-      return NextResponse.json(
-        { success: false, error: "Could not find payment/shipping/shipped columns in header row" },
-        { status: 400 }
-      );
+    const updates: { range: string; values: string[][] }[] = [];
+
+    // --- Shape (A): update a single field ---
+    if (field) {
+      let idx = -1;
+      if (field === "paymentStatus") idx = idxPayment;
+      if (field === "shippingRequired") idx = idxShipReq;
+      if (field === "shippedStatus") idx = idxShipped;
+      if (idx < 0) {
+        return NextResponse.json({ success: false, error: `Could not find column for ${field}` }, { status: 400 });
+      }
+      updates.push({ range: `${tabName}!${colLetter(idx)}${row}`, values: [[value === "Y" ? "Y" : ""]] });
+    } else {
+      // --- Shape (B): update multiple fields at once ---
+      const paymentStatus = body.paymentStatus === "Y" ? "Y" : "";
+      const shippingRequired = body.shippingRequired === "Y" ? "Y" : "";
+      const shippedStatus = body.shippedStatus === "Y" ? "Y" : "";
+
+      if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) {
+        return NextResponse.json(
+          { success: false, error: "Could not find payment/shipping/shipped columns in header row" },
+          { status: 400 }
+        );
+      }
+
+      updates.push({ range: `${tabName}!${colLetter(idxPayment)}${row}`, values: [[paymentStatus]] });
+      updates.push({ range: `${tabName}!${colLetter(idxShipReq)}${row}`, values: [[shippingRequired]] });
+      updates.push({ range: `${tabName}!${colLetter(idxShipped)}${row}`, values: [[shippedStatus]] });
     }
-
-    const data = [
-      { range: `${tabName}!${colLetter(idxPayment)}${rowNumber}`, values: [[paymentStatus]] },
-      { range: `${tabName}!${colLetter(idxShipReq)}${rowNumber}`, values: [[shippingRequired]] },
-      { range: `${tabName}!${colLetter(idxShipped)}${rowNumber}`, values: [[shippedStatus]] },
-    ];
 
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: sheetId,
-      requestBody: { valueInputOption: "RAW", data },
+      requestBody: { valueInputOption: "RAW", data: updates },
     });
 
     return NextResponse.json({ success: true });
   } catch (e: any) {
-    return NextResponse.json(
-      { success: false, error: e?.message || String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: e?.message || String(e) }, { status: 500 });
   }
 }

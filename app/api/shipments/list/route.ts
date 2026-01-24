@@ -4,26 +4,23 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
+
 function norm(v: any) {
-  return String(v ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
+  return String(v ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function jsonOk(payload: any, status = 200) {
-  return NextResponse.json(payload, { status });
+function isYes(v: any) {
+  const n = norm(v);
+  return n === "y" || n === "yes" || n === "true" || n === "1";
 }
 
-function getCredentials() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) return { ok: false as const, error: "Missing GOOGLE_SERVICE_ACCOUNT_JSON env var" };
-  try {
-    const creds = JSON.parse(raw);
-    return { ok: true as const, creds };
-  } catch {
-    return { ok: false as const, error: "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON" };
-  }
+function isBlank(v: any) {
+  return String(v ?? "").trim() === "";
 }
 
 function pickHeaderIndex(headers: string[], candidates: string[]) {
@@ -32,6 +29,7 @@ function pickHeaderIndex(headers: string[], candidates: string[]) {
     const i = H.indexOf(norm(c));
     if (i >= 0) return i;
   }
+  // fallback: partial match
   for (let i = 0; i < H.length; i++) {
     const h = H[i];
     if (candidates.some((c) => h.includes(norm(c)))) return i;
@@ -39,84 +37,174 @@ function pickHeaderIndex(headers: string[], candidates: string[]) {
   return -1;
 }
 
-function colLetter(index0: number) {
-  // 0 -> A, 25 -> Z, 26 -> AA
-  let n = index0 + 1;
-  let s = "";
-  while (n > 0) {
-    const r = (n - 1) % 26;
-    s = String.fromCharCode(65 + r) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
+function extractAuctionNumber(name: string) {
+  const m = String(name || "").match(/(\d+)/);
+  return m?.[1] ?? "";
 }
 
-export async function POST(req: Request) {
-  try {
-    const body = await req.json().catch(() => null);
-    if (!body) return jsonOk({ success: false, error: "Invalid JSON body" }, 200);
+async function listAllSpreadsheetsInFolder(drive: any, folderId: string) {
+  const out: { id: string; name: string }[] = [];
+  let pageToken: string | undefined = undefined;
 
-    const { sheetId, row, field, value } = body as {
-      sheetId: string;
-      row: number;
-      field: "paymentStatus" | "shippingRequired" | "shippedStatus";
-      value: string; // "Y" or ""
-    };
+  const q = [
+    `'${folderId}' in parents`,
+    `mimeType='application/vnd.google-apps.spreadsheet'`,
+    `trashed=false`,
+  ].join(" and ");
 
-    if (!sheetId || !row || !field) {
-      return jsonOk({ success: false, error: "Missing sheetId, row, or field" }, 200);
+  do {
+    const res = await drive.files.list({
+      q,
+      fields: "nextPageToken,files(id,name)",
+      pageSize: 100,
+      pageToken,
+    });
+    for (const f of res.data.files ?? []) {
+      if (f.id && f.name) out.push({ id: f.id, name: f.name });
     }
+    pageToken = res.data.nextPageToken || undefined;
+  } while (pageToken);
 
-    const c = getCredentials();
-    if (!c.ok) return jsonOk({ success: false, error: c.error }, 200);
+  return out;
+}
+
+async function buildInvoiceUrlMap(drive: any, folderId: string) {
+  const map = new Map<string, string>();
+  let pageToken: string | undefined = undefined;
+
+  const q = [`'${folderId}' in parents`, `mimeType='application/pdf'`, `trashed=false`].join(" and ");
+
+  do {
+    const res = await drive.files.list({
+      q,
+      fields: "nextPageToken,files(id,name,webViewLink,webContentLink)",
+      pageSize: 1000,
+      pageToken,
+    });
+    for (const f of res.data.files ?? []) {
+      const name = String(f.name ?? "");
+      const key = name.toLowerCase();
+      const url = (f.webViewLink || f.webContentLink || "") as string;
+      if (key && url) map.set(key, url);
+    }
+    pageToken = res.data.nextPageToken || undefined;
+  } while (pageToken);
+
+  return map;
+}
+
+function findHeaderRowIndex(rows: any[][]) {
+  // scan first 30 rows for a header row (some sheets have notes above the real header)
+  const scanMax = Math.min(rows.length, 30);
+  for (let i = 0; i < scanMax; i++) {
+    const r = rows[i] || [];
+    const n = r.map((x) => norm(x));
+    if (n.includes("bidder number") || n.includes("bidder #") || n.includes("bidcard") || n.includes("bid card")) {
+      return i;
+    }
+  }
+  return 0; // fallback: assume row 1 is header
+}
+
+export async function GET() {
+  try {
+    const creds = JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON"));
+    const sheetsFolderId = mustEnv("AUCTION_SHEETS_FOLDER_ID");
+
+    const invoiceFolderId = process.env.INVOICE_PDF_FOLDER_ID || "";
+    const tabNameEnv = process.env.SHEET_TAB_NAME || ""; // optional override
 
     const auth = new google.auth.GoogleAuth({
-      credentials: c.creds,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+      credentials: creds,
+      scopes: [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+      ],
     });
 
+    const drive = google.drive({ version: "v3", auth });
     const sheets = google.sheets({ version: "v4", auth });
 
-    // Get first sheet name + headers so we know what column to update
-    const meta = await sheets.spreadsheets.get({
-      spreadsheetId: sheetId,
-      fields: "sheets(properties(title))",
-    });
+    const spreadsheets = await listAllSpreadsheetsInFolder(drive, sheetsFolderId);
 
-    const sheetName = meta.data.sheets?.[0]?.properties?.title || "Sheet1";
+    // build invoice lookup once (fast)
+    const invoiceMap = invoiceFolderId ? await buildInvoiceUrlMap(drive, invoiceFolderId) : new Map<string, string>();
 
-    const valuesRes = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: `${sheetName}!A:Z`,
-    });
+    const shipments: any[] = [];
 
-    const rows = valuesRes.data.values ?? [];
-    if (rows.length < 1) return jsonOk({ success: false, error: "Sheet has no header row" }, 200);
+    for (const file of spreadsheets) {
+      const spreadsheetId = file.id;
 
-    const headers = (rows[0] as any[]).map((x) => String(x ?? ""));
+      // determine tab
+      let tabName = tabNameEnv;
+      if (!tabName) {
+        const meta = await sheets.spreadsheets.get({
+          spreadsheetId,
+          fields: "sheets(properties(title))",
+        });
+        tabName = meta.data.sheets?.[0]?.properties?.title || "Sheet1";
+      }
 
-    let idx = -1;
-    if (field === "paymentStatus") idx = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
-    if (field === "shippingRequired") idx = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-    if (field === "shippedStatus") idx = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped"]);
+      const valuesRes = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${tabName}!A:Z`,
+      });
 
-    if (idx < 0) {
-      return jsonOk({ success: false, error: `Could not find column for ${field}` }, 200);
+      const rows = (valuesRes.data.values ?? []) as any[][];
+      if (rows.length < 2) continue;
+
+      const headerRowIndex = findHeaderRowIndex(rows);
+      const headers = (rows[headerRowIndex] ?? []).map((x) => String(x ?? ""));
+
+      const idxBidcard = pickHeaderIndex(headers, ["bidder number", "bidder #", "bidcard", "bid card"]);
+      const idxFirst = pickHeaderIndex(headers, ["buyer first name", "first name", "firstname"]);
+      const idxLast = pickHeaderIndex(headers, ["buyer last name", "last name", "lastname"]);
+      const idxLots = pickHeaderIndex(headers, ["lots bought", "lots won", "lots", "lot count"]);
+      const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
+      const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
+      const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status", "shipment status"]);
+
+      if (idxBidcard < 0 || idxShipReq < 0 || idxShipped < 0) continue;
+
+      for (let r = headerRowIndex + 1; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const bidcard = String(row[idxBidcard] ?? "").trim();
+        if (!bidcard) continue;
+
+        const shippingReq = row[idxShipReq];
+        const shipped = row[idxShipped];
+        const payment = idxPayment >= 0 ? row[idxPayment] : "";
+
+        // Outstanding shipment rule:
+        // - Shipping required = Y
+        // - Shipped status is blank
+        // - If a payment column exists, require paid = Y
+        const paidOk = true;
+        const outstanding = isYes(shippingReq) && isBlank(shipped) && paidOk;
+        if (!outstanding) continue;
+
+        const invoiceKey = `${bidcard}.pdf`.toLowerCase();
+        const invoiceUrl = invoiceMap.get(invoiceKey) || "";
+
+        shipments.push({
+          sheetId: spreadsheetId,
+          sheetName: file.name,
+          row: r + 1, // 1-based
+          auction: extractAuctionNumber(file.name),
+          bidcard,
+          firstName: idxFirst >= 0 ? String(row[idxFirst] ?? "").trim() : "",
+          lastName: idxLast >= 0 ? String(row[idxLast] ?? "").trim() : "",
+          lotsWon: idxLots >= 0 ? String(row[idxLots] ?? "").trim() : "",
+          paymentStatus: idxPayment >= 0 ? String(row[idxPayment] ?? "").trim() : "",
+          shippingRequired: String(row[idxShipReq] ?? "").trim(),
+          shippedStatus: String(row[idxShipped] ?? "").trim(),
+          invoiceUrl: invoiceUrl || null,
+        });
+      }
     }
 
-    const cell = `${sheetName}!${colLetter(idx)}${row}`;
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: cell,
-      valueInputOption: "RAW",
-      requestBody: {
-        values: [[value ?? ""]],
-      },
-    });
-
-    return jsonOk({ success: true, updated: { sheetId, cell, value: value ?? "" } }, 200);
+    return NextResponse.json({ success: true, count: shipments.length, shipments });
   } catch (e: any) {
-    return jsonOk({ success: false, error: e?.message || "Update failed" }, 200);
+    return NextResponse.json({ success: false, count: 0, shipments: [], error: e?.message || String(e) });
   }
 }
