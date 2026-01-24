@@ -3,23 +3,41 @@
 import { useEffect, useMemo, useState } from "react";
 
 type ShipmentItem = {
-  auctionNumber: number;
-  auctionName: string;
+  auctionNumber?: number | null;
+  auctionName?: string;
   bidderNumber: string;
-  firstName: string;
-  lastName: string;
-  lotsBought: number;
-  paymentStatus: string;
-  shippingRequired: string;
-  shippedStatus: string;
+  firstName?: string;
+  lastName?: string;
+  lotsBought?: number | string;
+  paymentStatus?: string;
+  shippingRequired?: string;
+  shippedStatus?: string;
 };
 
-function isY(v: string | undefined | null) {
-  const t = (v ?? "").trim().toLowerCase();
-  return t === "y" || t.startsWith("y ");
+function norm(v: any) {
+  return String(v ?? "").trim();
 }
 
-function Pill({ variant, text }: { variant: "green" | "red"; text: string }) {
+function isYes(v: any) {
+  return norm(v).toLowerCase().startsWith("y");
+}
+
+function isBlank(v: any) {
+  return norm(v) === "";
+}
+
+function toNumber(v: any) {
+  const n = Number(String(v ?? "").replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function Pill({
+  variant,
+  text,
+}: {
+  variant: "green" | "red" | "yellow";
+  text: string;
+}) {
   const style: React.CSSProperties =
     variant === "green"
       ? {
@@ -29,6 +47,19 @@ function Pill({ variant, text }: { variant: "green" | "red"; text: string }) {
           background: "rgba(16, 185, 129, 0.18)",
           border: "1px solid rgba(16, 185, 129, 0.35)",
           color: "rgba(167, 243, 208, 1)",
+          fontSize: 12,
+          fontWeight: 900,
+          letterSpacing: 0.7,
+          textTransform: "uppercase",
+        }
+      : variant === "yellow"
+      ? {
+          display: "inline-block",
+          padding: "6px 10px",
+          borderRadius: 999,
+          background: "rgba(234, 179, 8, 0.14)",
+          border: "1px solid rgba(234, 179, 8, 0.35)",
+          color: "rgba(253, 230, 138, 1)",
           fontSize: 12,
           fontWeight: 900,
           letterSpacing: 0.7,
@@ -46,6 +77,7 @@ function Pill({ variant, text }: { variant: "green" | "red"; text: string }) {
           letterSpacing: 0.7,
           textTransform: "uppercase",
         };
+
   return <span style={style}>{text}</span>;
 }
 
@@ -64,14 +96,32 @@ export default function ShipmentsPage() {
   async function load() {
     setLoading(true);
     setError(null);
+
     try {
+      // ✅ CORRECT ENDPOINT
       const res = await fetch("/api/auctions/shipments/list", { cache: "no-store" });
       const json = await res.json();
-      if (!res.ok || json?.success === false) throw new Error(json?.error || "Failed to load");
-      setItems(json.shipments || []);
-      setOutstandingCount(json.outstandingCount ?? json.count ?? 0);
+
+      if (!res.ok || json?.success === false) {
+        throw new Error(json?.error || "Failed to load shipments");
+      }
+
+      const raw: ShipmentItem[] = Array.isArray(json?.shipments) ? json.shipments : [];
+
+      // ✅ YOUR EXACT RULES:
+      // Payment Status: Y
+      // Shipping Required: Y
+      // Shipped Status: BLANK
+      const pending = raw.filter((x) => {
+        return isYes(x.paymentStatus) && isYes(x.shippingRequired) && isBlank(x.shippedStatus);
+      });
+
+      setItems(pending);
+      setOutstandingCount(pending.length);
     } catch (e: any) {
-      setError(e?.message || "Failed to load");
+      setError(e?.message || "Failed to load shipments");
+      setItems([]);
+      setOutstandingCount(0);
     } finally {
       setLoading(false);
     }
@@ -87,21 +137,27 @@ export default function ShipmentsPage() {
 
     if (query) {
       arr = arr.filter((x) => {
-        const name = `${x.firstName} ${x.lastName}`.toLowerCase();
+        const name = `${norm(x.firstName)} ${norm(x.lastName)}`.toLowerCase();
         return (
           name.includes(query) ||
-          String(x.bidderNumber).includes(query) ||
-          String(x.auctionNumber).includes(query)
+          String(x.bidderNumber || "").toLowerCase().includes(query) ||
+          String(x.auctionNumber ?? "").includes(query) ||
+          String(x.auctionName || "").toLowerCase().includes(query)
         );
       });
     }
 
     const sorted = [...arr];
     sorted.sort((a, b) => {
-      if (sortMode === "AUCTION_ASC") return a.auctionNumber - b.auctionNumber;
-      if (sortMode === "AUCTION_DESC") return b.auctionNumber - a.auctionNumber;
-      if (sortMode === "LOTS_ASC") return (a.lotsBought || 0) - (b.lotsBought || 0);
-      return (b.lotsBought || 0) - (a.lotsBought || 0);
+      const aAuction = Number(a.auctionNumber ?? 0);
+      const bAuction = Number(b.auctionNumber ?? 0);
+      const aLots = toNumber(a.lotsBought);
+      const bLots = toNumber(b.lotsBought);
+
+      if (sortMode === "AUCTION_ASC") return aAuction - bAuction;
+      if (sortMode === "AUCTION_DESC") return bAuction - aAuction;
+      if (sortMode === "LOTS_ASC") return aLots - bLots;
+      return bLots - aLots;
     });
 
     return sorted;
@@ -140,11 +196,11 @@ export default function ShipmentsPage() {
           </div>
 
           <div className="mt-3">
-            <div className="text-xs text-neutral-400">Search (name or bidcard)</div>
+            <div className="text-xs text-neutral-400">Search (name, bidcard, auction)</div>
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Type name or bidcard..."
+              placeholder="Type name, bidcard, auction..."
               className="mt-1 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-3 text-sm outline-none focus:border-red-600"
             />
           </div>
@@ -173,39 +229,45 @@ export default function ShipmentsPage() {
 
         <div className="mt-4 space-y-3">
           {filtered.map((x) => {
-            const paymentIsY = isY(x.paymentStatus);
-            const shipReqIsY = isY(x.shippingRequired);
-            const shippedIsY = isY(x.shippedStatus);
+            const auctionNum = x.auctionNumber ?? 0;
+            const lots = toNumber(x.lotsBought);
 
             return (
               <a
-                key={`${x.auctionNumber}-${x.bidderNumber}`}
-                href={`/shipments/${encodeURIComponent(String(x.auctionNumber))}/${encodeURIComponent(
+                key={`${auctionNum}-${x.bidderNumber}`}
+                href={`/shipments/${encodeURIComponent(String(auctionNum))}/${encodeURIComponent(
                   x.bidderNumber
                 )}`}
                 className="block rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4"
               >
                 <div className="text-base font-extrabold text-neutral-100">
-                  {x.firstName} {x.lastName}
+                  {norm(x.firstName) || "Unknown"} {norm(x.lastName)}
                 </div>
+
                 <div className="mt-1 text-sm text-neutral-300">
-                  Bidcard: <span className="font-bold text-red-300">{x.bidderNumber}</span> ·
-                  Auction: <span className="font-bold text-neutral-100"> {x.auctionNumber}</span> ·
-                  Lots: <span className="font-bold text-neutral-100"> {x.lotsBought}</span>
+                  Bidcard:{" "}
+                  <span className="font-bold text-red-300">{x.bidderNumber}</span> · Auction:{" "}
+                  <span className="font-bold text-neutral-100">
+                    {auctionNum || "?"}
+                  </span>
+                  {x.auctionName ? (
+                    <span className="text-neutral-400"> ({x.auctionName})</span>
+                  ) : null}
+                  · Lots: <span className="font-bold text-neutral-100">{lots}</span>
                 </div>
 
                 <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                   <div>
                     <div className="text-xs text-neutral-400">Payment</div>
-                    <Pill variant={paymentIsY ? "green" : "red"} text={paymentIsY ? "PAID" : "NOT PAID"} />
+                    <Pill variant="green" text="PAID" />
                   </div>
                   <div>
                     <div className="text-xs text-neutral-400">Shipping required</div>
-                    <Pill variant={shipReqIsY ? "green" : "red"} text={shipReqIsY ? "YES" : "NO"} />
+                    <Pill variant="green" text="YES" />
                   </div>
                   <div>
-                    <div className="text-xs text-neutral-400">Shipped</div>
-                    <Pill variant={shippedIsY ? "green" : "red"} text={shippedIsY ? "SHIPPED" : "NO"} />
+                    <div className="text-xs text-neutral-400">Shipped status</div>
+                    <Pill variant="yellow" text="BLANK (PENDING)" />
                   </div>
                 </div>
               </a>
@@ -214,7 +276,7 @@ export default function ShipmentsPage() {
 
           {!loading && filtered.length === 0 && (
             <div className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-4 text-sm text-neutral-300">
-              No shipments found.
+              No outstanding shipments found (Paid=Y, Shipping Required=Y, Shipped Status blank).
             </div>
           )}
         </div>
