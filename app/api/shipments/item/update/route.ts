@@ -4,43 +4,55 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getAuth() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-  const credentials = JSON.parse(raw);
-
-  return new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"], // WRITE
-  });
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
 function norm(v: any) {
-  return String(v ?? "").toLowerCase().trim().replace(/\s+/g, " ");
+  return String(v ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function pickHeaderIndex(headers: string[], candidates: string[]) {
-  const h = headers.map((x) => norm(x));
+  const H = headers.map((h) => norm(h));
   for (const c of candidates) {
-    const idx = h.findIndex((x) => x === norm(c));
-    if (idx >= 0) return idx;
+    const i = H.indexOf(norm(c));
+    if (i >= 0) return i;
   }
-  for (const c of candidates) {
-    const idx = h.findIndex((x) => x.includes(norm(c)));
-    if (idx >= 0) return idx;
+  for (let i = 0; i < H.length; i++) {
+    const h = H[i];
+    if (candidates.some((c) => h.includes(norm(c)))) return i;
   }
   return -1;
 }
 
-function colLetter(colIndexZeroBased: number) {
-  let n = colIndexZeroBased + 1;
+function colLetter(index0: number) {
+  let n = index0 + 1;
   let s = "";
   while (n > 0) {
-    const mod = (n - 1) % 26;
-    s = String.fromCharCode(65 + mod) + s;
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
     n = Math.floor((n - 1) / 26);
   }
   return s;
+}
+
+function findHeaderRowIndex(rows: any[][]) {
+  const scanMax = Math.min(rows.length, 40);
+  for (let i = 0; i < scanMax; i++) {
+    const r = rows[i] || [];
+    const n = r.map((x) => norm(x));
+    if (
+      n.includes("bidder number") ||
+      n.includes("bidder #") ||
+      n.includes("bidcard") ||
+      n.includes("bid card")
+    ) {
+      return i;
+    }
+  }
+  return 0;
 }
 
 export async function POST(req: Request) {
@@ -51,75 +63,63 @@ export async function POST(req: Request) {
     }
 
     const sheetId = String(body.sheetId || "");
-
-    // Support BOTH payload shapes:
-    // (A) UI shape: { sheetId, row, field, value }
-    // (B) Legacy: { sheetId, rowNumber, paymentStatus, shippingRequired, shippedStatus }
-    const row = Number(body.row ?? body.rowNumber);
-
-    const field = body.field as ("paymentStatus" | "shippingRequired" | "shippedStatus" | undefined);
-    const value = String(body.value ?? "");
+    const row = Number(body.row);
+    const field = String(body.field || ""); // expects "shippedStatus"
+    const value = String(body.value ?? ""); // "Y" or ""
 
     if (!sheetId || !Number.isFinite(row) || row < 2) {
       return NextResponse.json({ success: false, error: "Missing/invalid sheetId or row" }, { status: 400 });
     }
 
-    const tabName = process.env.SHEET_TAB_NAME || "Sheet1";
-
-    const auth = getAuth();
-    const sheets = google.sheets({ version: "v4", auth });
-
-    const headersRes = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: `${tabName}!1:1`,
-    });
-
-    const headersRow = (headersRes.data.values || [])[0] || [];
-    const headers = headersRow.map((x: any) => String(x ?? ""));
-
-    const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
-    const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-    const idxShipped = pickHeaderIndex(headers, [
-      "shipped status",
-      "shipping status",
-      "shipped",
-      "ship status",
-      "shipment status",
-    ]);
-
-    const updates: { range: string; values: string[][] }[] = [];
-
-    // --- Shape (A): update a single field ---
-    if (field) {
-      let idx = -1;
-      if (field === "paymentStatus") idx = idxPayment;
-      if (field === "shippingRequired") idx = idxShipReq;
-      if (field === "shippedStatus") idx = idxShipped;
-      if (idx < 0) {
-        return NextResponse.json({ success: false, error: `Could not find column for ${field}` }, { status: 400 });
-      }
-      updates.push({ range: `${tabName}!${colLetter(idx)}${row}`, values: [[value === "Y" ? "Y" : ""]] });
-    } else {
-      // --- Shape (B): update multiple fields at once ---
-      const paymentStatus = body.paymentStatus === "Y" ? "Y" : "";
-      const shippingRequired = body.shippingRequired === "Y" ? "Y" : "";
-      const shippedStatus = body.shippedStatus === "Y" ? "Y" : "";
-
-      if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) {
-        return NextResponse.json(
-          { success: false, error: "Could not find payment/shipping/shipped columns in header row" },
-          { status: 400 }
-        );
-      }
-
-      updates.push({ range: `${tabName}!${colLetter(idxPayment)}${row}`, values: [[paymentStatus]] });
-      updates.push({ range: `${tabName}!${colLetter(idxShipReq)}${row}`, values: [[shippingRequired]] });
-      updates.push({ range: `${tabName}!${colLetter(idxShipped)}${row}`, values: [[shippedStatus]] });
+    if (field !== "shippedStatus") {
+      return NextResponse.json({ success: false, error: "Only shippedStatus can be updated here" }, { status: 400 });
     }
 
-    await sheets.spreadsheets.values.batchUpdate({
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    const meta = await sheets.spreadsheets.get({
       spreadsheetId: sheetId,
-      requestBody: { valueInputOption: "RAW", data: updates },
+      fields: "sheets(properties(title))",
+    });
+    const tab = meta.data.sheets?.[0]?.properties?.title;
+    if (!tab) throw new Error("No tabs found in spreadsheet");
+
+    const valuesRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${tab}!A:Z`,
+    });
+
+    const rows = (valuesRes.data.values ?? []) as any[][];
+    if (rows.length < 1) throw new Error("Sheet is empty");
+
+    const headerRowIndex = findHeaderRowIndex(rows);
+    const headers = (rows[headerRowIndex] ?? []).map((x) => String(x ?? ""));
+
+    const idxShipped = pickHeaderIndex(headers, [
+      "Shipped status",
+      "Shipping status",
+      "Shipped",
+      "Ship status",
+      "Shipment status",
+    ]);
+
+    if (idxShipped < 0) {
+      return NextResponse.json({ success: false, error: 'Missing column: "Shipped status"' }, { status: 400 });
+    }
+
+    const targetA1 = `${tab}!${colLetter(idxShipped)}${row}`;
+    const next = value === "Y" ? "Y" : "";
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: targetA1,
+      valueInputOption: "RAW",
+      requestBody: { values: [[next]] },
     });
 
     return NextResponse.json({ success: true });

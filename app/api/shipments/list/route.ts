@@ -29,7 +29,6 @@ function pickHeaderIndex(headers: string[], candidates: string[]) {
     const i = H.indexOf(norm(c));
     if (i >= 0) return i;
   }
-  // fallback: partial match
   for (let i = 0; i < H.length; i++) {
     const h = H[i];
     if (candidates.some((c) => h.includes(norm(c)))) return i;
@@ -37,13 +36,27 @@ function pickHeaderIndex(headers: string[], candidates: string[]) {
   return -1;
 }
 
-function extractAuctionNumber(name: string) {
-  const m = String(name || "").match(/(\d+)/);
-  return m?.[1] ?? "";
+function findHeaderRowIndex(rows: any[][]) {
+  const scanMax = Math.min(rows.length, 40);
+  for (let i = 0; i < scanMax; i++) {
+    const r = rows[i] || [];
+    const n = r.map((x) => norm(x));
+    if (
+      n.includes("bidder number") ||
+      n.includes("bidder #") ||
+      n.includes("bidcard") ||
+      n.includes("bid card")
+    ) {
+      return i;
+    }
+  }
+  return 0;
 }
 
-async function listAllSpreadsheetsInFolder(drive: ReturnType<typeof google.drive>, folderId: string) {
-
+async function listAllSpreadsheetsInFolder(
+  drive: ReturnType<typeof google.drive>,
+  folderId: string
+) {
   const out: { id: string; name: string }[] = [];
   let pageToken: string | undefined = undefined;
 
@@ -55,12 +68,12 @@ async function listAllSpreadsheetsInFolder(drive: ReturnType<typeof google.drive
 
   do {
     const res: any = await drive.files.list({
-
       q,
       fields: "nextPageToken,files(id,name)",
       pageSize: 100,
       pageToken,
     });
+
     for (const f of res.data.files ?? []) {
       if (f.id && f.name) out.push({ id: f.id, name: f.name });
     }
@@ -70,53 +83,78 @@ async function listAllSpreadsheetsInFolder(drive: ReturnType<typeof google.drive
   return out;
 }
 
-async function buildInvoiceUrlMap(drive: ReturnType<typeof google.drive>, folderId: string) {
+async function findFolderIdByName(
+  drive: ReturnType<typeof google.drive>,
+  parentFolderId: string,
+  folderName: string
+) {
+  const safeName = folderName.replace(/'/g, "\\'");
+  const q = [
+    `'${parentFolderId}' in parents`,
+    `mimeType='application/vnd.google-apps.folder'`,
+    `name='${safeName}'`,
+    `trashed=false`,
+  ].join(" and ");
 
-  const map = new Map<string, string>();
-  let pageToken: string | undefined = undefined;
+  const res: any = await drive.files.list({
+    q,
+    fields: "files(id,name)",
+    pageSize: 10,
+  });
 
-  const q = [`'${folderId}' in parents`, `mimeType='application/pdf'`, `trashed=false`].join(" and ");
-
-  do {
-    const res: any = await drive.files.list({
-
-      q,
-      fields: "nextPageToken,files(id,name,webViewLink,webContentLink)",
-      pageSize: 1000,
-      pageToken,
-    });
-    for (const f of res.data.files ?? []) {
-      const name = String(f.name ?? "");
-      const key = name.toLowerCase();
-      const url = (f.webViewLink || f.webContentLink || "") as string;
-      if (key && url) map.set(key, url);
-    }
-    pageToken = res.data.nextPageToken || undefined;
-  } while (pageToken);
-
-  return map;
+  return res.data.files?.[0]?.id || null;
 }
 
-function findHeaderRowIndex(rows: any[][]) {
-  // scan first 30 rows for a header row (some sheets have notes above the real header)
-  const scanMax = Math.min(rows.length, 30);
-  for (let i = 0; i < scanMax; i++) {
-    const r = rows[i] || [];
-    const n = r.map((x) => norm(x));
-    if (n.includes("bidder number") || n.includes("bidder #") || n.includes("bidcard") || n.includes("bid card")) {
-      return i;
-    }
-  }
-  return 0; // fallback: assume row 1 is header
+async function findPdfByBidcard(
+  drive: ReturnType<typeof google.drive>,
+  folderId: string,
+  bidcard: string
+) {
+  const safe = bidcard.replace(/'/g, "\\'");
+  const q = [
+    `'${folderId}' in parents`,
+    `mimeType='application/pdf'`,
+    `(name='${safe}.pdf' or name='${safe}')`,
+    `trashed=false`,
+  ].join(" and ");
+
+  const res: any = await drive.files.list({
+    q,
+    fields: "files(id,name,webViewLink,webContentLink)",
+    pageSize: 10,
+  });
+
+  return res.data.files?.[0] || null;
+}
+
+async function getInvoiceUrl(
+  drive: ReturnType<typeof google.drive>,
+  invoicesRootId: string,
+  auctionName: string,
+  bidcard: string
+) {
+  const auctionFolderId = await findFolderIdByName(
+    drive,
+    invoicesRootId,
+    auctionName
+  );
+  if (!auctionFolderId) return null;
+
+  const file = await findPdfByBidcard(drive, auctionFolderId, bidcard);
+  if (!file) return null;
+
+  return (
+    file.webViewLink ||
+    file.webContentLink ||
+    `https://drive.google.com/file/d/${file.id}/view`
+  ) as string;
 }
 
 export async function GET() {
   try {
     const creds = JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON"));
     const sheetsFolderId = mustEnv("AUCTION_SHEETS_FOLDER_ID");
-
-    const invoiceFolderId = process.env.INVOICE_PDF_FOLDER_ID || "";
-    const tabNameEnv = process.env.SHEET_TAB_NAME || ""; // optional override
+    const invoicesRootId = mustEnv("AUCTION_INVOICES_FOLDER_ID");
 
     const auth = new google.auth.GoogleAuth({
       credentials: creds,
@@ -129,29 +167,27 @@ export async function GET() {
     const drive = google.drive({ version: "v3", auth });
     const sheets = google.sheets({ version: "v4", auth });
 
-    const spreadsheets = await listAllSpreadsheetsInFolder(drive, sheetsFolderId);
-
-    // build invoice lookup once (fast)
-    const invoiceMap = invoiceFolderId ? await buildInvoiceUrlMap(drive, invoiceFolderId) : new Map<string, string>();
+    const spreadsheets = await listAllSpreadsheetsInFolder(
+      drive,
+      sheetsFolderId
+    );
 
     const shipments: any[] = [];
 
     for (const file of spreadsheets) {
       const spreadsheetId = file.id;
+      const auctionName = file.name; // "Auction 22"
 
-      // determine tab
-      let tabName = tabNameEnv;
-      if (!tabName) {
-        const meta = await sheets.spreadsheets.get({
-          spreadsheetId,
-          fields: "sheets(properties(title))",
-        });
-        tabName = meta.data.sheets?.[0]?.properties?.title || "Sheet1";
-      }
+      const meta = await sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets(properties(title))",
+      });
+      const tab = meta.data.sheets?.[0]?.properties?.title;
+      if (!tab) continue;
 
       const valuesRes = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: `${tabName}!A:Z`,
+        range: `${tab}!A:Z`,
       });
 
       const rows = (valuesRes.data.values ?? []) as any[][];
@@ -160,13 +196,40 @@ export async function GET() {
       const headerRowIndex = findHeaderRowIndex(rows);
       const headers = (rows[headerRowIndex] ?? []).map((x) => String(x ?? ""));
 
-      const idxBidcard = pickHeaderIndex(headers, ["bidder number", "bidder #", "bidcard", "bid card"]);
-      const idxFirst = pickHeaderIndex(headers, ["buyer first name", "first name", "firstname"]);
-      const idxLast = pickHeaderIndex(headers, ["buyer last name", "last name", "lastname"]);
-      const idxLots = pickHeaderIndex(headers, ["lots bought", "lots won", "lots", "lot count"]);
-      const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
-      const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-      const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status", "shipment status"]);
+      const idxBidcard = pickHeaderIndex(headers, [
+        "Bidder Number",
+        "Bidder #",
+        "Bidcard",
+        "Bid Card",
+      ]);
+      const idxFirst = pickHeaderIndex(headers, [
+        "Buyer First Name",
+        "First Name",
+        "Firstname",
+      ]);
+      const idxLast = pickHeaderIndex(headers, [
+        "Buyer Last Name",
+        "Last Name",
+        "Lastname",
+      ]);
+      const idxLots = pickHeaderIndex(headers, [
+        "Lots Bought",
+        "Lots Won",
+        "Lots",
+        "Lot Count",
+      ]);
+      const idxShipReq = pickHeaderIndex(headers, [
+        "Shipping Required",
+        "Ship Required",
+        "Shipping Request",
+      ]);
+      const idxShipped = pickHeaderIndex(headers, [
+        "Shipped status",
+        "Shipping status",
+        "Shipped",
+        "Ship status",
+        "Shipment status",
+      ]);
 
       if (idxBidcard < 0 || idxShipReq < 0 || idxShipped < 0) continue;
 
@@ -177,29 +240,25 @@ export async function GET() {
 
         const shippingReq = row[idxShipReq];
         const shipped = row[idxShipped];
-        const payment = idxPayment >= 0 ? row[idxPayment] : "";
 
-        // Outstanding shipment rule:
-        // - Shipping required = Y
-        // - Shipped status is blank
-        // - If a payment column exists, require paid = Y
-        const paidOk = true;
-        const outstanding = isYes(shippingReq) && isBlank(shipped) && paidOk;
-        if (!outstanding) continue;
+        if (!(isYes(shippingReq) && isBlank(shipped))) continue;
 
-        const invoiceKey = `${bidcard}.pdf`.toLowerCase();
-        const invoiceUrl = invoiceMap.get(invoiceKey) || "";
+        const invoiceUrl = await getInvoiceUrl(
+          drive,
+          invoicesRootId,
+          auctionName,
+          bidcard
+        );
 
         shipments.push({
           sheetId: spreadsheetId,
-          sheetName: file.name,
-          row: r + 1, // 1-based
-          auction: extractAuctionNumber(file.name),
+          sheetName: auctionName,
+          auction: auctionName,
+          row: r + 1,
           bidcard,
           firstName: idxFirst >= 0 ? String(row[idxFirst] ?? "").trim() : "",
           lastName: idxLast >= 0 ? String(row[idxLast] ?? "").trim() : "",
           lotsWon: idxLots >= 0 ? String(row[idxLots] ?? "").trim() : "",
-          paymentStatus: idxPayment >= 0 ? String(row[idxPayment] ?? "").trim() : "",
           shippingRequired: String(row[idxShipReq] ?? "").trim(),
           shippedStatus: String(row[idxShipped] ?? "").trim(),
           invoiceUrl: invoiceUrl || null,
@@ -209,6 +268,9 @@ export async function GET() {
 
     return NextResponse.json({ success: true, count: shipments.length, shipments });
   } catch (e: any) {
-    return NextResponse.json({ success: false, count: 0, shipments: [], error: e?.message || String(e) });
+    return NextResponse.json(
+      { success: false, count: 0, shipments: [], error: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
