@@ -11,10 +11,7 @@ function getAuth() {
 
   return new google.auth.GoogleAuth({
     credentials,
-    scopes: [
-      "https://www.googleapis.com/auth/drive.readonly",
-      "https://www.googleapis.com/auth/spreadsheets",
-    ],
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"], // WRITE
   });
 }
 
@@ -79,7 +76,7 @@ export async function POST(req: Request) {
 
     const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
     const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-    const idxShipped = pickHeaderIndex(headers, ["shipped", "shipping status", "ship status"]);
+    const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status"]);
 
     if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) {
       return NextResponse.json(

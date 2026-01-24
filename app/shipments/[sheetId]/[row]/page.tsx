@@ -1,190 +1,183 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 
-type ShipmentItem = {
+type Item = {
   sheetId: string;
-  row: number;
-
-  buyerFirstName?: string;
-  buyerLastName?: string;
-  auction?: string;
-  lotsWon?: string;
-  invoiceUrl?: string;
-
-  paymentStatus?: string;      // "Y" or ""
-  shippingRequired?: string;   // "Y" or ""
-  shippedStatus?: string;      // "Y" or ""
+  rowNumber: number;
+  bidcard: string;
+  firstName: string;
+  lastName: string;
+  lotsWon: string;
+  paymentStatus: string;
+  shippingRequired: string;
+  shippedStatus: string;
+  invoiceUrl: string | null;
 };
+
+function Toggle({ label, on, onClick }: { label: string; on: boolean; onClick: () => void }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", border: "1px solid #444", borderRadius: 12, padding: 12 }}>
+      <div style={{ fontWeight: 800 }}>{label}</div>
+      <button
+        onClick={onClick}
+        style={{
+          width: 70,
+          padding: "8px 10px",
+          borderRadius: 999,
+          border: "1px solid #444",
+          background: on ? "#16a34a" : "#dc2626",
+          color: "white",
+          fontWeight: 900
+        }}
+      >
+        {on ? "Y" : "—"}
+      </button>
+    </div>
+  );
+}
 
 export default function ShipmentDetailPage() {
   const params = useParams<{ sheetId: string; row: string }>();
   const router = useRouter();
 
-  const sheetId = params?.sheetId || "";
-  const row = Number(params?.row || "0");
+  const sheetId = decodeURIComponent(params.sheetId);
+  const rowNumber = Number(params.row);
 
+  const [item, setItem] = useState<Item | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string>("");
-  const [item, setItem] = useState<ShipmentItem | null>(null);
+  const [error, setError] = useState("");
 
-  const fetchItem = async () => {
+  async function load() {
     setLoading(true);
     setError("");
     try {
       const res = await fetch(
-        `/api/auctions/shipments/item?sheetId=${encodeURIComponent(sheetId)}&row=${encodeURIComponent(
-          String(row)
-        )}`,
+        `/api/shipments/item?sheetId=${encodeURIComponent(sheetId)}&rowNumber=${encodeURIComponent(String(rowNumber))}`,
         { cache: "no-store" }
       );
-
       const text = await res.text();
-      let data: any;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(`API did not return JSON. Got: ${text.slice(0, 80)}...`);
-      }
+      const data = JSON.parse(text);
 
-      if (!res.ok || !data?.success) {
-        throw new Error(data?.error || `Failed to load item (status ${res.status})`);
-      }
-
+      if (!res.ok || !data?.success) throw new Error(data?.error || "Failed to load item");
       setItem(data.item);
     } catch (e: any) {
-      setError(e?.message || "Unknown error");
+      setError(e?.message || String(e));
       setItem(null);
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  useEffect(() => {
-    if (!sheetId || !row) {
-      setLoading(false);
-      setError("Missing sheetId or row in the URL.");
-      return;
-    }
-    fetchItem();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sheetId, row]);
-
-  const yn = (v?: string) => (String(v || "").trim().toLowerCase().startsWith("y") ? "Y" : "");
-
-  const toggle = async (field: "paymentStatus" | "shippingRequired" | "shippedStatus") => {
-    if (!item) return;
-
-    const nextVal = yn(item[field]) === "Y" ? "" : "Y";
-    const nextItem = { ...item, [field]: nextVal };
-    setItem(nextItem);
-
+  async function save(next: Item) {
     setSaving(true);
     setError("");
     try {
-      const res = await fetch(`/api/auctions/shipments/item/update`, {
+      const res = await fetch("/api/shipments/item/update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sheetId,
-          row,
-          updates: { [field]: nextVal },
+          rowNumber,
+          paymentStatus: next.paymentStatus,
+          shippingRequired: next.shippingRequired,
+          shippedStatus: next.shippedStatus,
         }),
       });
-
       const text = await res.text();
-      let data: any;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(`Update API did not return JSON. Got: ${text.slice(0, 80)}...`);
-      }
+      const data = JSON.parse(text);
 
-      if (!res.ok || !data?.success) {
-        throw new Error(data?.error || `Update failed (status ${res.status})`);
+      if (!res.ok || !data?.success) throw new Error(data?.error || "Update failed");
+
+      // If shipped is now Y, go back to list
+      if (next.shippedStatus === "Y") {
+        router.push("/shipments");
+        return;
       }
     } catch (e: any) {
-      setError(e?.message || "Update failed");
-      // refresh from server to get back into sync
-      fetchItem();
+      setError(e?.message || String(e));
+      await load();
     } finally {
       setSaving(false);
     }
-  };
+  }
 
-  const pill = (on: boolean) =>
-    `px-3 py-2 rounded font-bold ${on ? "bg-green-600 text-white" : "bg-red-600 text-white"}`;
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (loading) return <div style={{ padding: 16 }}>Loading…</div>;
+
+  if (!item) {
+    return (
+      <div style={{ padding: 16 }}>
+        <Link href="/shipments" className="underline">← Back</Link>
+        <div style={{ marginTop: 12, border: "1px solid #ff5a5a", padding: 12, borderRadius: 10 }}>{error || "No item"}</div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ maxWidth: 900, margin: "0 auto", padding: 16 }}>
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
-        <button onClick={() => router.push("/shipments")} className="underline">
-          ← Back
-        </button>
-        <div style={{ opacity: 0.8 }}>
-          {saving ? "Saving..." : loading ? "Loading..." : ""}
-        </div>
-      </div>
+      <Link href="/shipments" className="underline">← Back</Link>
 
-      <h1 style={{ fontSize: 26, fontWeight: 800, marginBottom: 8 }}>Shipment Details</h1>
+      <h1 style={{ fontSize: 24, fontWeight: 900, marginTop: 12 }}>
+        {item.firstName} {item.lastName} • Bidcard {item.bidcard}
+      </h1>
 
       {error && (
-        <div style={{ border: "1px solid #ff5a5a", padding: 12, borderRadius: 8, marginBottom: 12 }}>
+        <div style={{ marginTop: 12, border: "1px solid #ff5a5a", padding: 12, borderRadius: 10 }}>
           {error}
         </div>
       )}
 
-      {loading && <div>Loading…</div>}
-
-      {!loading && item && (
-        <div style={{ border: "1px solid #333", padding: 14, borderRadius: 10 }}>
-          <div style={{ display: "grid", gap: 6 }}>
-            <div>
-              <b>Buyer:</b> {item.buyerFirstName || ""} {item.buyerLastName || ""}
-            </div>
-            <div>
-              <b>Auction:</b> {item.auction || "(unknown)"}
-            </div>
-            <div>
-              <b>Lots Won:</b> {item.lotsWon || ""}
-            </div>
-
-            {item.invoiceUrl ? (
-              <div>
-                <b>Invoice:</b>{" "}
-                <a href={item.invoiceUrl} target="_blank" rel="noreferrer" className="underline">
-                  Open invoice
-                </a>
-              </div>
-            ) : null}
-          </div>
-
-          <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-            <button
-              className={pill(yn(item.paymentStatus) === "Y")}
-              onClick={() => toggle("paymentStatus")}
-            >
-              Payment Status: {yn(item.paymentStatus) === "Y" ? "Y" : "Blank"}
-            </button>
-
-            <button
-              className={pill(yn(item.shippingRequired) === "Y")}
-              onClick={() => toggle("shippingRequired")}
-            >
-              Shipping Required: {yn(item.shippingRequired) === "Y" ? "Y" : "Blank"}
-            </button>
-
-            <button
-              className={pill(yn(item.shippedStatus) === "Y")}
-              onClick={() => toggle("shippedStatus")}
-            >
-              Shipped Status: {yn(item.shippedStatus) === "Y" ? "Y" : "Blank"}
-            </button>
-          </div>
+      <div style={{ marginTop: 12, border: "1px solid #333", borderRadius: 12, padding: 14 }}>
+        <div><b>Lots Won:</b> {item.lotsWon || "0"}</div>
+        <div style={{ marginTop: 10 }}>
+          <b>Invoice:</b>{" "}
+          {item.invoiceUrl ? (
+            <a href={item.invoiceUrl} target="_blank" rel="noreferrer" className="underline">Open invoice</a>
+          ) : (
+            <span style={{ opacity: 0.8 }}>No invoice found</span>
+          )}
         </div>
-      )}
+      </div>
+
+      <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+        <Toggle
+          label="Payment Status"
+          on={item.paymentStatus === "Y"}
+          onClick={() => {
+            const next = { ...item, paymentStatus: item.paymentStatus === "Y" ? "" : "Y" };
+            setItem(next);
+            save(next);
+          }}
+        />
+        <Toggle
+          label="Shipping Required"
+          on={item.shippingRequired === "Y"}
+          onClick={() => {
+            const next = { ...item, shippingRequired: item.shippingRequired === "Y" ? "" : "Y" };
+            setItem(next);
+            save(next);
+          }}
+        />
+        <Toggle
+          label="Shipped Status"
+          on={item.shippedStatus === "Y"}
+          onClick={() => {
+            const next = { ...item, shippedStatus: item.shippedStatus === "Y" ? "" : "Y" };
+            setItem(next);
+            save(next);
+          }}
+        />
+      </div>
+
+      {saving && <div style={{ marginTop: 10, opacity: 0.8 }}>Saving…</div>}
     </div>
   );
 }
