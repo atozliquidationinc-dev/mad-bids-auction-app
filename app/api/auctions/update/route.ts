@@ -1,243 +1,140 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
-function mustEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function norm(v: any) {
+  return String(v ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function normalizeAuctionName(input: string) {
-  const t = (input || "").trim();
-  if (!t) return "";
-  if (/^\d+$/.test(t)) return `Auction ${t}`;
-  if (/^auction\s+\d+$/i.test(t)) {
-    const num = t.match(/\d+/)?.[0] || "";
-    return `Auction ${num}`;
-  }
-  return t;
-}
+function getAuth() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
+  const credentials = JSON.parse(raw);
 
-function toLowerKey(s: string) {
-  return (s || "").trim().toLowerCase();
-}
-
-function colToLetter(colIndex1: number) {
-  // 1 -> A, 2 -> B ... 27 -> AA
-  let n = colIndex1;
-  let out = "";
-  while (n > 0) {
-    const r = (n - 1) % 26;
-    out = String.fromCharCode(65 + r) + out;
-    n = Math.floor((n - 1) / 26);
-  }
-  return out;
-}
-
-async function findSheetIdByNameInFolder(
-  drive: any,
-  folderId: string,
-  sheetName: string
-) {
-  const safeName = sheetName.replace(/'/g, "\\'");
-  const q = [
-    `'${folderId}' in parents`,
-    `mimeType='application/vnd.google-apps.spreadsheet'`,
-    `name='${safeName}'`,
-    `trashed=false`,
-  ].join(" and ");
-
-  const res = await drive.files.list({
-    q,
-    fields: "files(id,name)",
-    pageSize: 5,
+  // WRITE scopes:
+  return new google.auth.GoogleAuth({
+    credentials,
+    scopes: [
+      "https://www.googleapis.com/auth/drive",
+      "https://www.googleapis.com/auth/spreadsheets",
+    ],
   });
-
-  return res.data.files?.[0]?.id || null;
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
+    const sheetId = body?.sheetId;
+    const row = Number(body?.row);
 
-    const auctionRaw = body?.auction ?? "";
-    const bidderRaw =
-      body?.bidder ?? body?.bidderNumber ?? body?.bidcard ?? "";
+    // expects booleans:
+    // { paymentStatus: true/false, shippingRequired: true/false, shippedStatus: true/false }
+    const updates = body?.updates ?? {};
 
-    const updatesRaw = body?.updates ?? {};
-
-    const auctionName = normalizeAuctionName(String(auctionRaw));
-    const bidderNumber = String(bidderRaw || "").trim();
-
-    if (!auctionName || !bidderNumber) {
+    if (!sheetId || !Number.isFinite(row) || row < 2) {
       return NextResponse.json(
-        { success: false, error: "Missing auction or bidder number" },
+        { success: false, error: "Missing/invalid sheetId or row" },
         { status: 400 }
       );
     }
 
-    if (!updatesRaw || typeof updatesRaw !== "object") {
-      return NextResponse.json(
-        { success: false, error: "Missing updates object" },
-        { status: 400 }
-      );
-    }
-
-    const creds = JSON.parse(mustEnv("GOOGLE_SERVICE_ACCOUNT_JSON"));
-    const sheetsFolderId = mustEnv("AUCTION_SHEETS_FOLDER_ID");
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: [
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/spreadsheets",
-      ],
-    });
-
-    const drive = google.drive({ version: "v3", auth });
+    const auth = getAuth();
     const sheets = google.sheets({ version: "v4", auth });
 
-    // 1) Find the spreadsheet for this auction in your Sheets folder
-    const spreadsheetId = await findSheetIdByNameInFolder(
-      drive,
-      sheetsFolderId,
-      auctionName
-    );
-
-    if (!spreadsheetId) {
-      return NextResponse.json(
-        { success: false, error: `Auction sheet not found: ${auctionName}` },
-        { status: 404 }
-      );
-    }
-
-    // 2) Get first tab name (don't assume "Sheet1")
     const meta = await sheets.spreadsheets.get({
-      spreadsheetId,
-      fields: "sheets(properties(title))",
-    });
-    const tab = meta.data.sheets?.[0]?.properties?.title;
-    if (!tab) throw new Error("No tabs found in auction sheet");
-
-    // 3) Read all rows to locate header row + bidder row
-    const read = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${tab}!A:Z`,
+      spreadsheetId: sheetId,
+      fields: "sheets.properties.title",
     });
 
-    const rows = (read.data.values ?? []) as any[][];
-    if (!rows.length) {
-      return NextResponse.json(
-        { success: false, error: "Sheet is empty" },
-        { status: 400 }
-      );
-    }
+    const firstSheetTitle = meta.data.sheets?.[0]?.properties?.title;
+    if (!firstSheetTitle) throw new Error("Could not detect sheet tab name");
 
-    // 4) Find header row containing "Bidder Number"
-    let headerRowIndex = -1;
-    for (let i = 0; i < rows.length; i++) {
-      const normalized = (rows[i] || []).map((x) => toLowerKey(String(x ?? "")));
-      if (normalized.includes("bidder number")) {
-        headerRowIndex = i;
-        break;
+    // Pull headers to find the right columns
+    const valuesRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${firstSheetTitle}!A1:Z1`,
+    });
+
+    const headers = (valuesRes.data.values?.[0] ?? []).map((h) => String(h ?? "").trim());
+    const hNorm = headers.map((h) => norm(h));
+
+    const findCol = (options: string[]) => {
+      for (const o of options) {
+        const i = hNorm.indexOf(norm(o));
+        if (i !== -1) return i;
       }
-    }
+      return -1;
+    };
 
-    if (headerRowIndex === -1) {
+    const idxPay = findCol(["Payment Status", "Paid", "Payment"]);
+    const idxShipReq = findCol(["Shipping Required", "Shipping", "Ship Required"]);
+    const idxShipped = findCol(["Shipped status", "Shipping status", "Shipped", "Shipment status"]);
+
+    if (idxPay === -1 || idxShipReq === -1 || idxShipped === -1) {
       return NextResponse.json(
-        { success: false, error: 'Could not find header row ("Bidder Number")' },
-        { status: 400 }
+        { success: false, error: "Missing required shipment columns in sheet header" },
+        { status: 500 }
       );
     }
 
-    const header = (rows[headerRowIndex] || []).map((h) => String(h ?? "").trim());
-    const headerLower = header.map((h) => toLowerKey(h));
-
-    const bidderColIndex0 = headerLower.indexOf("bidder number");
-    if (bidderColIndex0 === -1) {
-      return NextResponse.json(
-        { success: false, error: 'Missing column: "Bidder Number"' },
-        { status: 400 }
-      );
-    }
-
-    // 5) Find bidder row
-    let bidderRowIndex = -1;
-    for (let i = headerRowIndex + 1; i < rows.length; i++) {
-      const cell = String(rows[i]?.[bidderColIndex0] ?? "").trim();
-      if (cell === bidderNumber) {
-        bidderRowIndex = i;
-        break;
+    // Helper: column number -> A1 letter
+    const colToA1 = (colIndexZero: number) => {
+      let n = colIndexZero + 1;
+      let s = "";
+      while (n > 0) {
+        const m = (n - 1) % 26;
+        s = String.fromCharCode(65 + m) + s;
+        n = Math.floor((n - 1) / 26);
       }
+      return s;
+    };
+
+    const writeOps: { range: string; value: string }[] = [];
+
+    if (typeof updates.paymentStatus === "boolean") {
+      writeOps.push({
+        range: `${firstSheetTitle}!${colToA1(idxPay)}${row}`,
+        value: updates.paymentStatus ? "Y" : "",
+      });
     }
-
-    if (bidderRowIndex === -1) {
-      return NextResponse.json(
-        { success: false, error: `Bidder not found: ${bidderNumber}` },
-        { status: 404 }
-      );
+    if (typeof updates.shippingRequired === "boolean") {
+      writeOps.push({
+        range: `${firstSheetTitle}!${colToA1(idxShipReq)}${row}`,
+        value: updates.shippingRequired ? "Y" : "",
+      });
     }
-
-    const sheetRowNumber = bidderRowIndex + 1; // 1-based row number in Sheets
-
-    // 6) Map updates keys to real header names (case-insensitive match)
-    const updates: Record<string, string> = {};
-    for (const [k, v] of Object.entries(updatesRaw)) {
-      updates[String(k)] = String(v ?? "");
-    }
-
-    const missingCols: string[] = [];
-    const batchData: { range: string; values: any[][] }[] = [];
-
-    for (const [key, value] of Object.entries(updates)) {
-      const keyLower = toLowerKey(key);
-
-      // find matching header by lowercase
-      const colIndex0 = headerLower.indexOf(keyLower);
-
-      if (colIndex0 === -1) {
-        missingCols.push(key);
-        continue;
-      }
-
-      const colLetter = colToLetter(colIndex0 + 1);
-      batchData.push({
-        range: `${tab}!${colLetter}${sheetRowNumber}`,
-        values: [[value]],
+    if (typeof updates.shippedStatus === "boolean") {
+      writeOps.push({
+        range: `${firstSheetTitle}!${colToA1(idxShipped)}${row}`,
+        value: updates.shippedStatus ? "Y" : "",
       });
     }
 
-    if (batchData.length === 0) {
+    if (writeOps.length === 0) {
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            "No valid columns found to update. Check your column names.",
-          missingColumns: missingCols,
-        },
+        { success: false, error: "No updates provided" },
         { status: 400 }
       );
     }
 
-    // 7) Write updates
+    // Batch update
     await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
+      spreadsheetId: sheetId,
       requestBody: {
         valueInputOption: "RAW",
-        data: batchData,
+        data: writeOps.map((op) => ({
+          range: op.range,
+          values: [[op.value]],
+        })),
       },
     });
 
-    return NextResponse.json({
-      success: true,
-      auctionName,
-      bidderNumber,
-      updated: Object.keys(updates),
-      missingColumns: missingCols,
-    });
+    return NextResponse.json({ success: true });
   } catch (e: any) {
     return NextResponse.json(
-      { success: false, error: e?.message || "Unknown error" },
+      { success: false, error: e?.message ?? String(e) },
       { status: 500 }
     );
   }
