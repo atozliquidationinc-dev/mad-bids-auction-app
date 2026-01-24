@@ -65,11 +65,11 @@ export default function ShipmentsPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/shipments/list", { cache: "no-store" });
+      const res = await fetch("/api/auctions/shipments/list", { cache: "no-store" });
       const json = await res.json();
       if (!res.ok || json?.success === false) throw new Error(json?.error || "Failed to load");
       setItems(json.shipments || []);
-      setOutstandingCount(json.outstandingCount || 0);
+      setOutstandingCount(json.outstandingCount ?? json.count ?? 0);
     } catch (e: any) {
       setError(e?.message || "Failed to load");
     } finally {
