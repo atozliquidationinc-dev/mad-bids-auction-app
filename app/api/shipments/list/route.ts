@@ -4,274 +4,119 @@ import { google } from "googleapis";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getAuth() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-  const credentials = JSON.parse(raw);
-
-  return new google.auth.GoogleAuth({
-    credentials,
-    scopes: [
-      "https://www.googleapis.com/auth/drive.readonly",
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
-    ],
-  });
-}
-
 function norm(v: any) {
-  return String(v ?? "").toLowerCase().trim().replace(/\s+/g, " ");
+  return String(v ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
 }
-function isYes(v: any) {
-  const n = norm(v);
-  return n === "y" || n === "yes" || n === "true" || n === "1";
+
+function jsonOk(payload: any, status = 200) {
+  return NextResponse.json(payload, { status });
 }
-function isBlank(v: any) {
-  return norm(v) === "";
+
+function getCredentials() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return { ok: false as const, error: "Missing GOOGLE_SERVICE_ACCOUNT_JSON env var" };
+  try {
+    const creds = JSON.parse(raw);
+    return { ok: true as const, creds };
+  } catch {
+    return { ok: false as const, error: "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON" };
+  }
 }
 
 function pickHeaderIndex(headers: string[], candidates: string[]) {
-  const h = headers.map((x) => norm(x));
+  const H = headers.map((h) => norm(h));
   for (const c of candidates) {
-    const idx = h.findIndex((x) => x === norm(c));
-    if (idx >= 0) return idx;
+    const i = H.indexOf(norm(c));
+    if (i >= 0) return i;
   }
-  for (const c of candidates) {
-    const idx = h.findIndex((x) => x.includes(norm(c)));
-    if (idx >= 0) return idx;
+  for (let i = 0; i < H.length; i++) {
+    const h = H[i];
+    if (candidates.some((c) => h.includes(norm(c)))) return i;
   }
   return -1;
 }
 
-function parseAuctionNumberFromTitle(title: string) {
-  const m = String(title || "").match(/(\d{1,4})/);
-  return m ? Number(m[1]) : null;
+function colLetter(index0: number) {
+  // 0 -> A, 25 -> Z, 26 -> AA
+  let n = index0 + 1;
+  let s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
 }
 
-export async function GET() {
+export async function POST(req: Request) {
   try {
-    const AUCTIONS_FOLDER_ID = process.env.AUCTIONS_FOLDER_ID;
-    if (!AUCTIONS_FOLDER_ID) {
-      return NextResponse.json(
-        { success: false, error: "Missing AUCTIONS_FOLDER_ID (Drive folder that contains your auction Google Sheets)" },
-        { status: 500 }
-      );
+    const body = await req.json().catch(() => null);
+    if (!body) return jsonOk({ success: false, error: "Invalid JSON body" }, 200);
+
+    const { sheetId, row, field, value } = body as {
+      sheetId: string;
+      row: number;
+      field: "paymentStatus" | "shippingRequired" | "shippedStatus";
+      value: string; // "Y" or ""
+    };
+
+    if (!sheetId || !row || !field) {
+      return jsonOk({ success: false, error: "Missing sheetId, row, or field" }, 200);
     }
 
-    const tabName = process.env.SHEET_TAB_NAME || "Sheet1";
+    const c = getCredentials();
+    if (!c.ok) return jsonOk({ success: false, error: c.error }, 200);
 
-    const auth = getAuth();
-    const drive = google.drive({ version: "v3", auth });
-    const sheets = google.sheets({ version: "v4", auth });
-
-    const filesRes = await drive.files.list({
-      q: `'${AUCTIONS_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
-      fields: "files(id,name)",
-      pageSize: 200,
+    const auth = new google.auth.GoogleAuth({
+      credentials: c.creds,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
 
-    const files = filesRes.data.files || [];
-    const shipments: any[] = [];
-
-    for (const f of files) {
-      if (!f.id) continue;
-
-      const sheetId = f.id;
-      const sheetName = f.name || "";
-      const auctionNumber = parseAuctionNumberFromTitle(sheetName);
-
-      const valuesRes = await sheets.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: `${tabName}!A:ZZ`,
-      });
-
-      const rows = valuesRes.data.values || [];
-      if (rows.length < 2) continue;
-
-      const headers = rows[0].map((x: any) => String(x ?? ""));
-
-      const idxBidcard = pickHeaderIndex(headers, ["bidder number", "bidder #", "bidcard", "bid card"]);
-      const idxFirst = pickHeaderIndex(headers, ["buyer first name", "first name", "firstname"]);
-      const idxLast = pickHeaderIndex(headers, ["buyer last name", "last name", "lastname"]);
-      const idxLots = pickHeaderIndex(headers, ["lots bought", "lots won", "lots", "lot count"]);
-
-      const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
-      const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-      const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status"]);
-
-      // Must have these to filter
-      if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) continue;
-
-      for (let r = 1; r < rows.length; r++) {
-        const row = rows[r] || [];
-
-        const paymentVal = row[idxPayment];
-        const shipReqVal = row[idxShipReq];
-        const shippedVal = row[idxShipped];
-
-        // outstanding shipments rule
-        if (isYes(paymentVal) && isYes(shipReqVal) && isBlank(shippedVal)) {
-          const rowNumber = r + 1;
-
-          shipments.push({
-            sheetId,
-            sheetName,
-            auctionNumber,
-            rowNumber,
-            bidcard: idxBidcard >= 0 ? String(row[idxBidcard] ?? "").trim() : "",
-            firstName: idxFirst >= 0 ? String(row[idxFirst] ?? "").trim() : "",
-            lastName: idxLast >= 0 ? String(row[idxLast] ?? "").trim() : "",
-            lotsWon: idxLots >= 0 ? String(row[idxLots] ?? "").trim() : "",
-            paymentStatus: "Y",
-            shippingRequired: "Y",
-            shippedStatus: "",
-          });
-        }
-      }
-    }
-
-    return NextResponse.json({ success: true, count: shipments.length, shipments });
-  } catch (e: any) {
-    return NextResponse.json(
-      { success: false, error: e?.message || String(e) },
-      { status: 500 }
-    );
-  }
-}import { NextResponse } from "next/server";
-import { google } from "googleapis";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-function getAuth() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
-  const credentials = JSON.parse(raw);
-
-  return new google.auth.GoogleAuth({
-    credentials,
-    scopes: [
-      "https://www.googleapis.com/auth/drive.readonly",
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
-    ],
-  });
-}
-
-function norm(v: any) {
-  return String(v ?? "").toLowerCase().trim().replace(/\s+/g, " ");
-}
-function isYes(v: any) {
-  const n = norm(v);
-  return n === "y" || n === "yes" || n === "true" || n === "1";
-}
-function isBlank(v: any) {
-  return norm(v) === "";
-}
-
-function pickHeaderIndex(headers: string[], candidates: string[]) {
-  const h = headers.map((x) => norm(x));
-  for (const c of candidates) {
-    const idx = h.findIndex((x) => x === norm(c));
-    if (idx >= 0) return idx;
-  }
-  for (const c of candidates) {
-    const idx = h.findIndex((x) => x.includes(norm(c)));
-    if (idx >= 0) return idx;
-  }
-  return -1;
-}
-
-function parseAuctionNumberFromTitle(title: string) {
-  const m = String(title || "").match(/(\d{1,4})/);
-  return m ? Number(m[1]) : null;
-}
-
-export async function GET() {
-  try {
-    const AUCTIONS_FOLDER_ID = process.env.AUCTIONS_FOLDER_ID;
-    if (!AUCTIONS_FOLDER_ID) {
-      return NextResponse.json(
-        { success: false, error: "Missing AUCTIONS_FOLDER_ID (Drive folder that contains your auction Google Sheets)" },
-        { status: 500 }
-      );
-    }
-
-    const tabName = process.env.SHEET_TAB_NAME || "Sheet1";
-
-    const auth = getAuth();
-    const drive = google.drive({ version: "v3", auth });
     const sheets = google.sheets({ version: "v4", auth });
 
-    const filesRes = await drive.files.list({
-      q: `'${AUCTIONS_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
-      fields: "files(id,name)",
-      pageSize: 200,
+    // Get first sheet name + headers so we know what column to update
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId: sheetId,
+      fields: "sheets(properties(title))",
     });
 
-    const files = filesRes.data.files || [];
-    const shipments: any[] = [];
+    const sheetName = meta.data.sheets?.[0]?.properties?.title || "Sheet1";
 
-    for (const f of files) {
-      if (!f.id) continue;
+    const valuesRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${sheetName}!A:Z`,
+    });
 
-      const sheetId = f.id;
-      const sheetName = f.name || "";
-      const auctionNumber = parseAuctionNumberFromTitle(sheetName);
+    const rows = valuesRes.data.values ?? [];
+    if (rows.length < 1) return jsonOk({ success: false, error: "Sheet has no header row" }, 200);
 
-      const valuesRes = await sheets.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: `${tabName}!A:ZZ`,
-      });
+    const headers = (rows[0] as any[]).map((x) => String(x ?? ""));
 
-      const rows = valuesRes.data.values || [];
-      if (rows.length < 2) continue;
+    let idx = -1;
+    if (field === "paymentStatus") idx = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
+    if (field === "shippingRequired") idx = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
+    if (field === "shippedStatus") idx = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped"]);
 
-      const headers = rows[0].map((x: any) => String(x ?? ""));
-
-      const idxBidcard = pickHeaderIndex(headers, ["bidder number", "bidder #", "bidcard", "bid card"]);
-      const idxFirst = pickHeaderIndex(headers, ["buyer first name", "first name", "firstname"]);
-      const idxLast = pickHeaderIndex(headers, ["buyer last name", "last name", "lastname"]);
-      const idxLots = pickHeaderIndex(headers, ["lots bought", "lots won", "lots", "lot count"]);
-
-      const idxPayment = pickHeaderIndex(headers, ["payment status", "paid", "payment"]);
-      const idxShipReq = pickHeaderIndex(headers, ["shipping required", "ship required", "shipping"]);
-      const idxShipped = pickHeaderIndex(headers, ["shipped status", "shipping status", "shipped", "ship status"]);
-
-      // Must have these to filter
-      if (idxPayment < 0 || idxShipReq < 0 || idxShipped < 0) continue;
-
-      for (let r = 1; r < rows.length; r++) {
-        const row = rows[r] || [];
-
-        const paymentVal = row[idxPayment];
-        const shipReqVal = row[idxShipReq];
-        const shippedVal = row[idxShipped];
-
-        // outstanding shipments rule
-        if (isYes(paymentVal) && isYes(shipReqVal) && isBlank(shippedVal)) {
-          const rowNumber = r + 1;
-
-          shipments.push({
-            sheetId,
-            sheetName,
-            auctionNumber,
-            rowNumber,
-            bidcard: idxBidcard >= 0 ? String(row[idxBidcard] ?? "").trim() : "",
-            firstName: idxFirst >= 0 ? String(row[idxFirst] ?? "").trim() : "",
-            lastName: idxLast >= 0 ? String(row[idxLast] ?? "").trim() : "",
-            lotsWon: idxLots >= 0 ? String(row[idxLots] ?? "").trim() : "",
-            paymentStatus: "Y",
-            shippingRequired: "Y",
-            shippedStatus: "",
-          });
-        }
-      }
+    if (idx < 0) {
+      return jsonOk({ success: false, error: `Could not find column for ${field}` }, 200);
     }
 
-    return NextResponse.json({ success: true, count: shipments.length, shipments });
+    const cell = `${sheetName}!${colLetter(idx)}${row}`;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: cell,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[value ?? ""]],
+      },
+    });
+
+    return jsonOk({ success: true, updated: { sheetId, cell, value: value ?? "" } }, 200);
   } catch (e: any) {
-    return NextResponse.json(
-      { success: false, error: e?.message || String(e) },
-      { status: 500 }
-    );
+    return jsonOk({ success: false, error: e?.message || "Update failed" }, 200);
   }
 }
